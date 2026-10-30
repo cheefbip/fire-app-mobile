@@ -1,22 +1,40 @@
+import bbox from "@turf/bbox";
+import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
+
 import {
-  Camera,
-  GeoJSONSource,
-  Layer,
-  Map,
+	Camera,
+	GeoJSONSource,
+	Layer,
+	Map,
 } from "@maplibre/maplibre-react-native";
 import { useCallback, useEffect, useState } from "react";
 import {
-  ActivityIndicator,
-  Pressable,
-  ScrollView,
-  Text,
-  View,
+	ActivityIndicator,
+	Pressable,
+	ScrollView,
+	Text,
+	View,
 } from "react-native";
+
 
 const MAPTILER_API_KEY = process.env.EXPO_PUBLIC_MAPTILER_API_KEY;
 
-const ENDPOINT =
-	"https://services9.arcgis.com/RHVPKKiFTONKtxq3/ArcGIS/rest/services/Satellite_VIIRS_Thermal_Hotspots_and_Fire_Activity/FeatureServer/0/query";
+const FIRMS_MAP_KEY = process.env.EXPO_PUBLIC_FIRMS_MAP_KEY;
+
+const FIRMS_SOURCES = [
+	"VIIRS_NOAA20_NRT",
+	"VIIRS_NOAA21_NRT",
+	"VIIRS_SNPP_NRT",
+];
+
+const FIRMS_AREAS = [
+	"-125,24,-66,50",
+	"-180,51,-129,72",
+	"172,50,180,55",
+	"-161,18,-154,23",
+];
+
+const PERIMETER_ENDPOINT = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/ArcGIS/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query";
 
 type Hotspot = {
 	type: "Feature";
@@ -41,37 +59,210 @@ type FireCollection = {
 	features: Hotspot[];
 };
 
+
+type FirePerimeter = {
+	type: "Feature";
+	id?: number | string;
+	geometry:
+	| {
+		type: "Polygon";
+		coordinates: number[][][];
+	}
+	| {
+		type: "MultiPolygon";
+		coordinates: number[][][][];
+	};
+	properties: Record<string, unknown>;
+};
+
+type PerimeterCollection = {
+	type: "FeatureCollection";
+	features: FirePerimeter[];
+};
+
+const EMPTY_PERIMETERS: PerimeterCollection = {
+	type: "FeatureCollection",
+	features: [],
+};
+
 const EMPTY_DATA: FireCollection = {
 	type: "FeatureCollection",
 	features: [],
 };
 
-function makeQueryURL(hours: number) {
-	const since = new Date(Date.now() - hours * 3600000)
-		.toISOString()
-		.slice(0, 19)
-		.replace("T", " ");
+async function fetchFirms(hours: number): Promise<FireCollection> {
+	if (!FIRMS_MAP_KEY) {
+		throw new Error("Missing EXPO_PUBLIC_FIRMS_MAP_KEY in .env");
+	}
 
-	const params = new URLSearchParams({
-		f: "json",
-		where: `acq_time >= TIMESTAMP '${since}'`,
-		geometry: JSON.stringify({
-			xmin: -125,
-			ymin: 32,
-			xmax: -113,
-			ymax: 43,
-		}),
-		geometryType: "esriGeometryEnvelope",
-		inSR: "4326",
-		outSR: "4326",
-		spatialRel: "esriSpatialRelIntersects",
-		returnGeometry: "true",
-		outFields: "OBJECTID,acq_time,satellite,confidence,frp,bright_ti4,daynight",
-		orderByFields: "acq_time DESC,OBJECTID DESC",
-		resultRecordCount: "5000",
-	});
+	const now = Date.now();
+	const cutoff = now - hours * 60 * 60 * 1000;
+	const dayMs = 24 * 60 * 60 * 1000;
+	const firstDay = Math.floor(cutoff / dayMs) * dayMs;
+	const today = Math.floor(now / dayMs) * dayMs;
 
-	return `${ENDPOINT}?${params.toString()}`;
+	const requests: Promise<string>[] = [];
+
+	for (const source of FIRMS_SOURCES) {
+		for (const area of FIRMS_AREAS) {
+
+			for (let start = firstDay; start <= today; start += 5 * dayMs) {
+				const days = Math.min(
+					5,
+					Math.floor((today - start) / dayMs) + 1
+				);
+
+				const date = new Date(start).toISOString().slice(0, 10);
+
+				const url =
+					"https://firms.modaps.eosdis.nasa.gov/api/area/csv/" +
+					`${encodeURIComponent(FIRMS_MAP_KEY)}/` +
+					`${source}/${area}/${days}/${date}`;
+
+				requests.push(
+					(async () => {
+						const response = await fetch(url);
+
+						if (!response.ok) {
+							throw new Error(
+								`NASA ${source} request failed (${response.status})`
+							);
+						}
+
+						return response.text();
+					})()
+				);
+			}
+		}
+	}
+
+
+
+	const csvFiles = await Promise.all(requests);
+
+
+	const features: {
+		geometry: { x: number; y: number };
+		attributes: {
+			OBJECTID: number;
+			acq_time: number;
+			satellite: string;
+			confidence: string;
+			frp: number | null;
+			bright_ti4: number | null;
+			daynight: string;
+		};
+	}[] = [];
+
+	const seen = new Set<string>();
+
+	const optionalNumber = (value: string | undefined) => {
+		if (value == null || value.trim() === "") return null;
+
+		const number = Number(value);
+		return Number.isFinite(number) ? number : null;
+	};
+
+	for (const csv of csvFiles) {
+		const lines = csv
+			.replace(/^\uFEFF/, "")
+			.trim()
+			.split(/\r?\n/);
+
+
+		const headers = lines[0].split(",").map((value) => value.trim());
+
+		const required = [
+			"latitude",
+			"longitude",
+			"acq_date",
+			"acq_time",
+			"satellite",
+			"confidence",
+		];
+
+		if (!required.every((name) => headers.includes(name))) {
+			throw new Error(
+				"Unexpected NASA response. Check your API key " +
+				"and FIRMS data availability."
+			);
+		}
+
+		for (const line of lines.slice(1)) {
+			if (!line.trim()) continue;
+
+			const values = line.split(",");
+			const row: Record<string, string> = {};
+
+			headers.forEach((header, index) => {
+				row[header] = values[index]?.trim() ?? "";
+			});
+
+			const longitude = optionalNumber(row.longitude);
+			const latitude = optionalNumber(row.latitude);
+
+
+			const time = row.acq_time.padStart(4, "0");
+
+			if (
+				!/^\d{4}-\d{2}-\d{2}$/.test(row.acq_date) ||
+				!/^\d{4}$/.test(time)
+			) {
+				continue;
+			}
+
+			const detected = Date.parse(
+				`${row.acq_date}T${time.slice(0, 2)}:` +
+				`${time.slice(2, 4)}:00Z`
+			);
+
+			if (
+				longitude == null ||
+				latitude == null ||
+				Math.abs(longitude) > 180 ||
+				Math.abs(latitude) > 90 ||
+				!Number.isFinite(detected) ||
+				detected < cutoff ||
+				detected > now
+			) {
+				continue;
+			}
+
+			const key =
+				`${row.satellite}|${detected}|${longitude}|${latitude}`;
+
+			if (seen.has(key)) continue;
+			seen.add(key);
+
+			const confidence = row.confidence.toLowerCase();
+
+			features.push({
+				geometry: {
+					x: longitude,
+					y: latitude,
+				},
+				attributes: {
+					OBJECTID: features.length + 1,
+					acq_time: detected,
+					satellite: row.satellite || "Not reported",
+					confidence:
+						confidence === "l" ? "Low" :
+							confidence === "n" ? "Nominal" :
+								confidence === "h" ? "High" :
+									row.confidence || "Not reported",
+					frp: optionalNumber(row.frp),
+					bright_ti4: optionalNumber(row.bright_ti4),
+					daynight: row.daynight,
+				},
+			});
+		}
+	}
+
+	features.sort(
+		(a, b) => b.attributes.acq_time - a.attributes.acq_time
+	);
+
+	return toGeoJSON({ features });
 }
 
 function toGeoJSON(data: any): FireCollection {
@@ -135,29 +326,252 @@ function formatTime(value: number | null) {
 	return new Date(value).toISOString().replace("T", " ").slice(0, 19) + " UTC";
 }
 
+async function fetchPerimeters(): Promise<PerimeterCollection> {
+	const features: FirePerimeter[] = [];
+	const pageSize = 1000;
+	let offset = 0;
+
+	while (true) {
+		const params = new URLSearchParams({
+			f: "geojson",
+			where: "attr_IncidentTypeCategory = 'WF'",
+			outFields: [
+				"OBJECTID",
+				"poly_IncidentName",
+				"poly_IRWINID",
+				"poly_PolygonDateTime",
+				"attr_IncidentTypeCategory",
+				"attr_FireDiscoveryDateTime",
+				"attr_PercentContained",
+				"attr_ContainmentDateTime",
+				"attr_ControlDateTime",
+				"attr_FireOutDateTime",
+				"attr_ModifiedOnDateTime_dt",
+			].join(","),
+			returnGeometry: "true",
+			outSR: "4326",
+			orderByFields: "OBJECTID ASC",
+			resultOffset: String(offset),
+			resultRecordCount: String(pageSize),
+		});
+
+		const response = await fetch(
+			`${PERIMETER_ENDPOINT}?${params.toString()}`
+		);
+
+		if (!response.ok) {
+			throw new Error(
+				`Perimeter request failed (${response.status})`
+			);
+		}
+
+		const data = await response.json();
+
+		if (data.error) {
+			throw new Error(
+				data.error.message || "Unable to load perimeters"
+			);
+		}
+
+		if (
+			data.type !== "FeatureCollection" ||
+			!Array.isArray(data.features)
+		) {
+			throw new Error("Unexpected perimeter response");
+		}
+
+		for (const feature of data.features) {
+			if (
+				feature.geometry?.type === "Polygon" ||
+				feature.geometry?.type === "MultiPolygon"
+			) {
+				features.push(feature);
+			}
+		}
+
+		const count = data.features.length;
+
+		if (count === 0) break;
+
+		offset += count;
+
+		const more =
+			data.exceededTransferLimit === true ||
+			data.properties?.exceededTransferLimit === true;
+
+		if (count < pageSize && !more) break;
+	}
+
+	return {
+		type: "FeatureCollection",
+		features,
+	};
+}
+
+async function filterHotspotsToPerimeters(
+	hotspots: FireCollection,
+	perimeters: PerimeterCollection
+): Promise<FireCollection> {
+	const indexed = perimeters.features.map((perimeter) => ({
+		perimeter,
+		bounds: bbox(perimeter),
+	}));
+
+	const features: Hotspot[] = [];
+
+	for (let i = 0; i < hotspots.features.length; i++) {
+		if (i > 0 && i % 250 === 0) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		}
+
+		const hotspot = hotspots.features[i];
+		const [longitude, latitude] = hotspot.geometry.coordinates;
+
+		const matches = indexed.some(({ perimeter, bounds }) => {
+			const [west, south, east, north] = bounds;
+
+			if (
+				longitude < west ||
+				longitude > east ||
+				latitude < south ||
+				latitude > north
+			) {
+				return false;
+			}
+
+			return booleanPointInPolygon(hotspot, perimeter);
+		});
+
+		if (matches) {
+			features.push(hotspot);
+		}
+	}
+
+	return {
+		type: "FeatureCollection",
+		features,
+	};
+}
+
+function readableObservation(value: number | null) {
+	if (value == null || !Number.isFinite(value)) {
+		return "Not reported";
+	}
+
+	const date = new Date(value);
+
+	const formatted = date.toLocaleString(undefined, {
+		month: "short",
+		day: "numeric",
+		year: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+		timeZoneName: "short",
+	});
+
+	const minutes = Math.floor((Date.now() - value) / 60000);
+
+	if (minutes < 0) return formatted;
+
+	const age =
+		minutes < 1 ? "less than a minute ago" :
+			minutes < 60 ? `${minutes} minutes ago` :
+				minutes < 1440 ? `${Math.floor(minutes / 60)} hours ago` :
+					`${Math.floor(minutes / 1440)} days ago`;
+
+	return `${formatted} (${age})`;
+}
+
+function readableSatellite(value: string) {
+	const names: Record<string, string> = {
+		N: "Suomi NPP",
+		SNPP: "Suomi NPP",
+		N20: "NOAA-20",
+		"1": "NOAA-20",
+		N21: "NOAA-21",
+		"2": "NOAA-21",
+	};
+
+	return names[value.trim().toUpperCase()] ?? value;
+}
+
+function perimeterTimestamp(value: unknown): number | null {
+	if (typeof value === "number") {
+		return Number.isFinite(value) ? value : null;
+	}
+
+	if (typeof value === "string" && value.trim() !== "") {
+		const timestamp = /^\d+$/.test(value.trim())
+			? Number(value)
+			: Date.parse(value);
+
+		return Number.isFinite(timestamp) ? timestamp : null;
+	}
+
+	return null;
+}
+
+function readableContainment(value: unknown): string {
+	if (
+		value == null ||
+		(typeof value !== "number" && typeof value !== "string") ||
+		String(value).trim() === ""
+	) {
+		return "Not reported";
+	}
+
+	const percent = Number(value);
+
+	if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
+		return "Not reported";
+	}
+
+	return `${percent}% contained`;
+}
+
 export default function HomeScreen() {
 	const [hours, setHours] = useState(24);
 	const [fires, setFires] = useState<FireCollection>(EMPTY_DATA);
+	const [perimeters, setPerimeters] =
+		useState<PerimeterCollection>(EMPTY_PERIMETERS);
 	const [selected, setSelected] = useState<Hotspot | null>(null);
+	const [selectedPerimeter, setSelectedPerimeter] =
+		useState<FirePerimeter | null>(null);
+	const [showTechnical, setShowTechnical] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
+
 
 	const refresh = useCallback(async () => {
 		setLoading(true);
 		setError("");
 
 		try {
-			const response = await fetch(makeQueryURL(hours));
+			const [hotspotData, perimeterData] = await Promise.all([
+				fetchFirms(hours),
+				fetchPerimeters(),
+			]);
 
-			if (!response.ok) {
-				throw new Error(`Request failed (${response.status})`);
-			}
+			const filteredHotspots = await filterHotspotsToPerimeters(
+				hotspotData,
+				perimeterData
+			);
 
-			const result = toGeoJSON(await response.json());
-			setFires(result);
+			console.log("Wildfire matching:", {
+				hours,
+				nasaHotspots: hotspotData.features.length,
+				perimeters: perimeterData.features.length,
+				matchedHotspots: filteredHotspots.features.length,
+			});
+
+			setFires(filteredHotspots);
+			setPerimeters(perimeterData);
 			setSelected(null);
+			setSelectedPerimeter(null);
 		} catch (e) {
-			setError(e instanceof Error ? e.message : "Unable to load fire data");
+			setError(
+				e instanceof Error ? e.message : "Unable to load fire data"
+			);
 		} finally {
 			setLoading(false);
 		}
@@ -178,14 +592,89 @@ export default function HomeScreen() {
 				style={{ flex: 1 }}
 				mapStyle="https://tiles.openfreemap.org/styles/liberty"
 				onPress={() => setSelected(null)}
+				dragPan={true}
+				touchZoom={true}
+				doubleTapHoldZoom={false}
 			>
-				<Camera centerCoordinate={[-119.4179, 36.7783]} zoomLevel={5} />
+
+				<GeoJSONSource
+					id="wildfire-perimeters"
+					data={perimeters}
+					onPress={(event) => {
+						event.stopPropagation();
+
+						const pressed = event.nativeEvent.features.find(
+							(feature) =>
+								feature.geometry.type === "Polygon" ||
+								feature.geometry.type === "MultiPolygon"
+						);
+
+						if (!pressed) return;
+
+						const pressedId =
+							pressed.properties?.OBJECTID ?? pressed.id;
+
+						if (pressedId == null) return;
+
+						const perimeter = perimeters.features.find(
+							(feature) =>
+								String(feature.properties.OBJECTID ?? feature.id) ===
+								String(pressedId)
+						);
+
+						setSelected(null);
+						setShowTechnical(false);
+						setSelectedPerimeter(perimeter ?? null);
+					}}
+				>
+					<Layer
+						id="wildfire-perimeter-fill"
+						type="fill"
+						paint={{
+							"fill-color": "#ff6b35",
+							"fill-opacity": 0.2,
+						}}
+					/>
+
+					<Layer
+						id="wildfire-perimeter-outline"
+						type="line"
+						paint={{
+							"line-color": "#ff9500",
+							"line-width": 2,
+						}}
+					/>
+				</GeoJSONSource>
+
+				<Camera initialViewState={{ center: [-98.5795, 39.8283], zoom: 3 }} />
 
 				<GeoJSONSource
 					id="fire-hotspots"
 					data={fires}
 					cluster={true}
 					clusterRadius={35}
+					onPress={(event) => {
+						event.stopPropagation();
+
+						const pressed = event.nativeEvent.features.find(
+							(feature) =>
+								feature.geometry.type === "Point" &&
+								feature.properties?.cluster !== true &&
+								feature.properties?.id != null
+						);
+
+						if (!pressed) return;
+
+						const hotspot = fires.features.find(
+							(feature) =>
+								String(feature.properties.id) ===
+								String(pressed.properties?.id)
+						);
+						setShowTechnical(false);
+						setSelectedPerimeter(null);
+						setSelected(hotspot ?? null);
+					}}
+
 				>
 					<Layer
 						id="fire-hotspot-circles"
@@ -223,20 +712,23 @@ export default function HomeScreen() {
 				}}
 			>
 				<Text style={{ color: "white", fontSize: 21, fontWeight: "bold" }}>
-					California Fire Watch
+					Ignis
 				</Text>
 
 				<Text style={{ color: "#cbd5e1", marginTop: 4 }}>
 					{loading
 						? "Loading satellite detections..."
-						: `${fires.features.length.toLocaleString()} hotspots found`}
-				</Text>
+						: `${fires.features.length.toLocaleString()} hotspots • ${perimeters.features.length.toLocaleString()} perimeter features`
+					}</Text>
 
 				<View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
 					{[24, 48, 168].map((value) => (
 						<Pressable
 							key={value}
-							onPress={() => setHours(value)}
+							onPress={() => {
+								console.log("Time button pressed:", value);
+								setHours(value);
+							}}
 							style={{
 								paddingVertical: 8,
 								paddingHorizontal: 13,
@@ -274,6 +766,108 @@ export default function HomeScreen() {
 				)}
 			</View>
 
+			{selectedPerimeter && (
+				<View
+					style={{
+						position: "absolute",
+						bottom: 24,
+						left: 16,
+						right: 16,
+						maxHeight: "45%",
+						backgroundColor: "#101820f5",
+						borderRadius: 14,
+						padding: 16,
+					}}
+				>
+					<ScrollView>
+						<Text
+							style={{
+								color: "white",
+								fontSize: 20,
+								fontWeight: "bold",
+							}}
+						>
+							{String(
+								selectedPerimeter.properties.poly_IncidentName ||
+								"Fire name not reported"
+							)}
+						</Text>
+
+						<Text style={{ color: "#ffd166", marginTop: 6 }}>
+							Reported wildfire boundary
+						</Text>
+
+						<Text style={{ color: "#e2e8f0", marginTop: 16 }}>
+							Classification: Reported wildfire
+						</Text>
+
+						<Text style={{ color: "#e2e8f0", marginTop: 12 }}>
+							Reported containment:{" "}
+							{readableContainment(
+								selectedPerimeter.properties.attr_PercentContained
+							)}
+						</Text>
+
+						<Text style={{ color: "#e2e8f0", marginTop: 12 }}>
+							Incident record updated:
+							{"\n"}
+							{readableObservation(
+								perimeterTimestamp(
+									selectedPerimeter.properties.attr_ModifiedOnDateTime_dt
+								)
+							)}
+						</Text>
+
+						<Text style={{ color: "#e2e8f0", marginTop: 12 }}>
+							Reported out date:
+							{"\n"}
+							{readableObservation(
+								perimeterTimestamp(
+									selectedPerimeter.properties.attr_FireOutDateTime
+								)
+							)}
+						</Text>
+
+						<Text style={{ color: "#94a3b8", marginTop: 12 }}>
+							Containment is not the same as extinguishment.
+							A missing out date does not confirm current burning.
+						</Text>
+
+						<Text style={{ color: "#e2e8f0", marginTop: 16 }}>
+							Boundary captured:
+							{"\n"}
+							{readableObservation(
+								perimeterTimestamp(
+									selectedPerimeter.properties.poly_PolygonDateTime
+								)
+							)}
+						</Text>
+
+						<Text style={{ color: "#94a3b8", marginTop: 12 }}>
+							This is the reported mapped fire extent. It does not
+							mean the entire area is currently burning.
+						</Text>
+
+						<Text style={{ color: "#cbd5e1", marginTop: 12 }}>
+							Boundary source: NIFC / WFIGS
+						</Text>
+
+						<Pressable
+							onPress={() => setSelectedPerimeter(null)}
+							style={{
+								marginTop: 16,
+								padding: 12,
+								borderRadius: 8,
+								backgroundColor: "#334155",
+							}}
+						>
+							<Text style={{ color: "white", textAlign: "center" }}>
+								Close
+							</Text>
+						</Pressable>
+					</ScrollView>
+				</View>
+			)}
 			{selectedProperties && (
 				<View
 					style={{
@@ -292,25 +886,60 @@ export default function HomeScreen() {
 						</Text>
 
 						<Text style={{ color: "#e2e8f0", marginTop: 8 }}>
-							Coordinates: {selected?.geometry.coordinates[1].toFixed(5)},{" "}
-							{selected?.geometry.coordinates[0].toFixed(5)}
-							{"\n"}Detected: {formatTime(selectedProperties.detected)}
-							{"\n"}Satellite: {selectedProperties.satellite}
-							{"\n"}Confidence: {selectedProperties.confidence}
-							{"\n"}Fire radiative power:{" "}
-							{selectedProperties.frp ?? "Not reported"} MW
-							{"\n"}Brightness temperature:{" "}
-							{selectedProperties.brightness ?? "Not reported"} K{"\n"}Day /
-							night: {selectedProperties.daynight}
+							Satellite observation:
+							{"\n"}
+							{readableObservation(selectedProperties.detected)}
+							{"\n\n"}Satellite:{" "}
+							{readableSatellite(selectedProperties.satellite)}
+							{"\n"}Detection confidence: {selectedProperties.confidence}
 						</Text>
 
 						<Text style={{ color: "#94a3b8", marginTop: 8 }}>
-							To enable tap-to-select, wire the GeoJSON source's onPress event
-							to setSelected using the pressed feature's properties.
+							Confidence describes the quality of the satellite heat
+							detection. It is not a wildfire risk rating.
+						</Text>
+
+						<Text style={{ color: "#94a3b8", marginTop: 8 }}>
+							This detection falls within a reported wildfire perimeter.
+							It does not establish that the location is still burning.
 						</Text>
 
 						<Pressable
-							onPress={() => setSelected(null)}
+							onPress={() => setShowTechnical((current) => !current)}
+							style={{ marginTop: 12, paddingVertical: 8 }}
+						>
+							<Text style={{ color: "#ffd166", fontWeight: "600" }}>
+								{showTechnical ? "Hide technical details" : "Show technical details"}
+							</Text>
+						</Pressable>
+
+						{showTechnical && (
+							<Text style={{ color: "#cbd5e1", marginTop: 8 }}>
+								Coordinates: {selected?.geometry.coordinates[1].toFixed(5)},{" "}
+								{selected?.geometry.coordinates[0].toFixed(5)}
+
+								{"\n\n"}Fire radiative power:{" "}
+								{selectedProperties.frp == null
+									? "Not reported"
+									: `${selectedProperties.frp} MW`}
+								{"\n"}Estimated radiant heat output associated with the
+								detection; not the fire's size.
+
+								{"\n\n"}Satellite brightness temperature:{" "}
+								{selectedProperties.brightness == null
+									? "Not reported"
+									: `${selectedProperties.brightness} K`}
+								{"\n"}An infrared measurement, not a direct flame temperature.
+
+								{"\n\n"}Observation period: {selectedProperties.daynight}
+							</Text>
+						)}
+
+						<Pressable
+							onPress={() => {
+								setSelected(null);
+								setSelectedPerimeter(null);
+							}}
 							style={{
 								marginTop: 12,
 								padding: 10,
