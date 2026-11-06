@@ -31,7 +31,6 @@ import {
 } from "@/lib/conditions";
 import { DEFAULT_BOUNDS, type Bounds } from "@/lib/geo";
 
-
 const MAPTILER_API_KEY = process.env.EXPO_PUBLIC_MAPTILER_API_KEY;
 
 const FIRMS_MAP_KEY = process.env.EXPO_PUBLIC_FIRMS_MAP_KEY;
@@ -49,7 +48,8 @@ const FIRMS_AREAS = [
 	"-161,18,-154,23",
 ];
 
-const PERIMETER_ENDPOINT = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/ArcGIS/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query";
+const PERIMETER_ENDPOINT =
+	"https://services3.arcgis.com/T4QMspbfLg3qTGWY/ArcGIS/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query";
 
 type Hotspot = {
 	type: "Feature";
@@ -74,19 +74,18 @@ type FireCollection = {
 	features: Hotspot[];
 };
 
-
 type FirePerimeter = {
 	type: "Feature";
 	id?: number | string;
 	geometry:
-	| {
-		type: "Polygon";
-		coordinates: number[][][];
-	}
-	| {
-		type: "MultiPolygon";
-		coordinates: number[][][][];
-	};
+		| {
+				type: "Polygon";
+				coordinates: number[][][];
+		  }
+		| {
+				type: "MultiPolygon";
+				coordinates: number[][][][];
+		  };
 	properties: Record<string, unknown>;
 };
 
@@ -120,12 +119,8 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 
 	for (const source of FIRMS_SOURCES) {
 		for (const area of FIRMS_AREAS) {
-
 			for (let start = firstDay; start <= today; start += 5 * dayMs) {
-				const days = Math.min(
-					5,
-					Math.floor((today - start) / dayMs) + 1
-				);
+				const days = Math.min(5, Math.floor((today - start) / dayMs) + 1);
 
 				const date = new Date(start).toISOString().slice(0, 10);
 
@@ -140,21 +135,18 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 
 						if (!response.ok) {
 							throw new Error(
-								`NASA ${source} request failed (${response.status})`
+								`NASA ${source} request failed (${response.status})`,
 							);
 						}
 
 						return response.text();
-					})()
+					})(),
 				);
 			}
 		}
 	}
 
-
-
 	const csvFiles = await Promise.all(requests);
-
 
 	const features: {
 		geometry: { x: number; y: number };
@@ -184,7 +176,6 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 			.trim()
 			.split(/\r?\n/);
 
-
 		const headers = lines[0].split(",").map((value) => value.trim());
 
 		const required = [
@@ -199,7 +190,7 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 		if (!required.every((name) => headers.includes(name))) {
 			throw new Error(
 				"Unexpected NASA response. Check your API key " +
-				"and FIRMS data availability."
+					"and FIRMS data availability.",
 			);
 		}
 
@@ -216,19 +207,14 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 			const longitude = optionalNumber(row.longitude);
 			const latitude = optionalNumber(row.latitude);
 
-
 			const time = row.acq_time.padStart(4, "0");
 
-			if (
-				!/^\d{4}-\d{2}-\d{2}$/.test(row.acq_date) ||
-				!/^\d{4}$/.test(time)
-			) {
+			if (!/^\d{4}-\d{2}-\d{2}$/.test(row.acq_date) || !/^\d{4}$/.test(time)) {
 				continue;
 			}
 
 			const detected = Date.parse(
-				`${row.acq_date}T${time.slice(0, 2)}:` +
-				`${time.slice(2, 4)}:00Z`
+				`${row.acq_date}T${time.slice(0, 2)}:` + `${time.slice(2, 4)}:00Z`,
 			);
 
 			if (
@@ -243,8 +229,7 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 				continue;
 			}
 
-			const key =
-				`${row.satellite}|${detected}|${longitude}|${latitude}`;
+			const key = `${row.satellite}|${detected}|${longitude}|${latitude}`;
 
 			if (seen.has(key)) continue;
 			seen.add(key);
@@ -261,10 +246,13 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 					acq_time: detected,
 					satellite: row.satellite || "Not reported",
 					confidence:
-						confidence === "l" ? "Low" :
-							confidence === "n" ? "Nominal" :
-								confidence === "h" ? "High" :
-									row.confidence || "Not reported",
+						confidence === "l"
+							? "Low"
+							: confidence === "n"
+								? "Nominal"
+								: confidence === "h"
+									? "High"
+									: row.confidence || "Not reported",
 					frp: optionalNumber(row.frp),
 					bright_ti4: optionalNumber(row.bright_ti4),
 					daynight: row.daynight,
@@ -273,9 +261,7 @@ async function fetchFirms(hours: number): Promise<FireCollection> {
 		}
 	}
 
-	features.sort(
-		(a, b) => b.attributes.acq_time - a.attributes.acq_time
-	);
+	features.sort((a, b) => b.attributes.acq_time - a.attributes.acq_time);
 
 	return toGeoJSON({ features });
 }
@@ -370,28 +356,19 @@ async function fetchPerimeters(): Promise<PerimeterCollection> {
 			resultRecordCount: String(pageSize),
 		});
 
-		const response = await fetch(
-			`${PERIMETER_ENDPOINT}?${params.toString()}`
-		);
+		const response = await fetch(`${PERIMETER_ENDPOINT}?${params.toString()}`);
 
 		if (!response.ok) {
-			throw new Error(
-				`Perimeter request failed (${response.status})`
-			);
+			throw new Error(`Perimeter request failed (${response.status})`);
 		}
 
 		const data = await response.json();
 
 		if (data.error) {
-			throw new Error(
-				data.error.message || "Unable to load perimeters"
-			);
+			throw new Error(data.error.message || "Unable to load perimeters");
 		}
 
-		if (
-			data.type !== "FeatureCollection" ||
-			!Array.isArray(data.features)
-		) {
+		if (data.type !== "FeatureCollection" || !Array.isArray(data.features)) {
 			throw new Error("Unexpected perimeter response");
 		}
 
@@ -425,7 +402,7 @@ async function fetchPerimeters(): Promise<PerimeterCollection> {
 
 async function filterHotspotsToPerimeters(
 	hotspots: FireCollection,
-	perimeters: PerimeterCollection
+	perimeters: PerimeterCollection,
 ): Promise<FireCollection> {
 	const indexed = perimeters.features.map((perimeter) => ({
 		perimeter,
@@ -489,10 +466,13 @@ function readableObservation(value: number | null) {
 	if (minutes < 0) return formatted;
 
 	const age =
-		minutes < 1 ? "less than a minute ago" :
-			minutes < 60 ? `${minutes} minutes ago` :
-				minutes < 1440 ? `${Math.floor(minutes / 60)} hours ago` :
-					`${Math.floor(minutes / 1440)} days ago`;
+		minutes < 1
+			? "less than a minute ago"
+			: minutes < 60
+				? `${minutes} minutes ago`
+				: minutes < 1440
+					? `${Math.floor(minutes / 60)} hours ago`
+					: `${Math.floor(minutes / 1440)} days ago`;
 
 	return `${formatted} (${age})`;
 }
@@ -590,7 +570,7 @@ export default function HomeScreen() {
 
 			const filteredHotspots = await filterHotspotsToPerimeters(
 				hotspotData,
-				perimeterData
+				perimeterData,
 			);
 
 			console.log("Wildfire matching:", {
@@ -605,9 +585,7 @@ export default function HomeScreen() {
 			setSelected(null);
 			setSelectedPerimeter(null);
 		} catch (e) {
-			setError(
-				e instanceof Error ? e.message : "Unable to load fire data"
-			);
+			setError(e instanceof Error ? e.message : "Unable to load fire data");
 		} finally {
 			setLoading(false);
 		}
@@ -638,9 +616,11 @@ export default function HomeScreen() {
 				}}
 				dragPan={true}
 				touchZoom={true}
+				// Always north-up and flat: no two-finger rotate or tilt.
+				touchRotate={false}
+				touchPitch={false}
 				doubleTapHoldZoom={false}
 			>
-
 				<GeoJSONSource
 					id="wildfire-perimeters"
 					data={perimeters}
@@ -650,20 +630,19 @@ export default function HomeScreen() {
 						const pressed = event.nativeEvent.features.find(
 							(feature) =>
 								feature.geometry.type === "Polygon" ||
-								feature.geometry.type === "MultiPolygon"
+								feature.geometry.type === "MultiPolygon",
 						);
 
 						if (!pressed) return;
 
-						const pressedId =
-							pressed.properties?.OBJECTID ?? pressed.id;
+						const pressedId = pressed.properties?.OBJECTID ?? pressed.id;
 
 						if (pressedId == null) return;
 
 						const perimeter = perimeters.features.find(
 							(feature) =>
 								String(feature.properties.OBJECTID ?? feature.id) ===
-								String(pressedId)
+								String(pressedId),
 						);
 
 						setSelected(null);
@@ -707,7 +686,7 @@ export default function HomeScreen() {
 							(feature) =>
 								feature.geometry.type === "Point" &&
 								feature.properties?.cluster !== true &&
-								feature.properties?.id != null
+								feature.properties?.id != null,
 						);
 
 						if (!pressed) return;
@@ -715,13 +694,12 @@ export default function HomeScreen() {
 						const hotspot = fires.features.find(
 							(feature) =>
 								String(feature.properties.id) ===
-								String(pressed.properties?.id)
+								String(pressed.properties?.id),
 						);
 						setShowTechnical(false);
 						setSelectedPerimeter(null);
 						setSelected(hotspot ?? null);
 					}}
-
 				>
 					<Layer
 						id="fire-hotspot-circles"
@@ -814,7 +792,15 @@ export default function HomeScreen() {
 						layout={{
 							visibility: showPlanes ? "visible" : "none",
 							"icon-image": "plane",
-							"icon-size": ["interpolate", ["linear"], ["zoom"], 4, 0.3, 10, 0.55],
+							"icon-size": [
+								"interpolate",
+								["linear"],
+								["zoom"],
+								4,
+								0.3,
+								10,
+								0.55,
+							],
 							"icon-rotate": ["get", "track"],
 							"icon-rotation-alignment": "map",
 							"icon-allow-overlap": true,
@@ -951,7 +937,7 @@ export default function HomeScreen() {
 						>
 							{String(
 								selectedPerimeter.properties.poly_IncidentName ||
-								"Fire name not reported"
+									"Fire name not reported",
 							)}
 						</Text>
 
@@ -966,7 +952,7 @@ export default function HomeScreen() {
 						<Text style={{ color: map.textBody, marginTop: 12 }}>
 							Reported containment:{" "}
 							{readableContainment(
-								selectedPerimeter.properties.attr_PercentContained
+								selectedPerimeter.properties.attr_PercentContained,
 							)}
 						</Text>
 
@@ -975,8 +961,8 @@ export default function HomeScreen() {
 							{"\n"}
 							{readableObservation(
 								perimeterTimestamp(
-									selectedPerimeter.properties.attr_ModifiedOnDateTime_dt
-								)
+									selectedPerimeter.properties.attr_ModifiedOnDateTime_dt,
+								),
 							)}
 						</Text>
 
@@ -985,14 +971,14 @@ export default function HomeScreen() {
 							{"\n"}
 							{readableObservation(
 								perimeterTimestamp(
-									selectedPerimeter.properties.attr_FireOutDateTime
-								)
+									selectedPerimeter.properties.attr_FireOutDateTime,
+								),
 							)}
 						</Text>
 
 						<Text style={{ color: map.textSubtle, marginTop: 12 }}>
-							Containment is not the same as extinguishment.
-							A missing out date does not confirm current burning.
+							Containment is not the same as extinguishment. A missing out date
+							does not confirm current burning.
 						</Text>
 
 						<Text style={{ color: map.textBody, marginTop: 16 }}>
@@ -1000,14 +986,14 @@ export default function HomeScreen() {
 							{"\n"}
 							{readableObservation(
 								perimeterTimestamp(
-									selectedPerimeter.properties.poly_PolygonDateTime
-								)
+									selectedPerimeter.properties.poly_PolygonDateTime,
+								),
 							)}
 						</Text>
 
 						<Text style={{ color: map.textSubtle, marginTop: 12 }}>
-							This is the reported mapped fire extent. It does not
-							mean the entire area is currently burning.
+							This is the reported mapped fire extent. It does not mean the
+							entire area is currently burning.
 						</Text>
 
 						<Text style={{ color: map.textMuted, marginTop: 12 }}>
@@ -1058,13 +1044,13 @@ export default function HomeScreen() {
 						</Text>
 
 						<Text style={{ color: map.textSubtle, marginTop: 8 }}>
-							Confidence describes the quality of the satellite heat
-							detection. It is not a wildfire risk rating.
+							Confidence describes the quality of the satellite heat detection.
+							It is not a wildfire risk rating.
 						</Text>
 
 						<Text style={{ color: map.textSubtle, marginTop: 8 }}>
-							This detection falls within a reported wildfire perimeter.
-							It does not establish that the location is still burning.
+							This detection falls within a reported wildfire perimeter. It does
+							not establish that the location is still burning.
 						</Text>
 
 						<Pressable
@@ -1072,7 +1058,9 @@ export default function HomeScreen() {
 							style={{ marginTop: 12, paddingVertical: 8 }}
 						>
 							<Text style={{ color: map.accent, fontWeight: "600" }}>
-								{showTechnical ? "Hide technical details" : "Show technical details"}
+								{showTechnical
+									? "Hide technical details"
+									: "Show technical details"}
 							</Text>
 						</Pressable>
 
@@ -1080,20 +1068,17 @@ export default function HomeScreen() {
 							<Text style={{ color: map.textMuted, marginTop: 8 }}>
 								Coordinates: {selected?.geometry.coordinates[1].toFixed(5)},{" "}
 								{selected?.geometry.coordinates[0].toFixed(5)}
-
 								{"\n\n"}Fire radiative power:{" "}
 								{selectedProperties.frp == null
 									? "Not reported"
 									: `${selectedProperties.frp} MW`}
 								{"\n"}Estimated radiant heat output associated with the
 								detection; not the fire&apos;s size.
-
 								{"\n\n"}Satellite brightness temperature:{" "}
 								{selectedProperties.brightness == null
 									? "Not reported"
 									: `${selectedProperties.brightness} K`}
 								{"\n"}An infrared measurement, not a direct flame temperature.
-
 								{"\n\n"}Observation period: {selectedProperties.daynight}
 							</Text>
 						)}
@@ -1110,7 +1095,9 @@ export default function HomeScreen() {
 								borderRadius: 8,
 							}}
 						>
-							<Text style={{ color: map.text, textAlign: "center" }}>Close</Text>
+							<Text style={{ color: map.text, textAlign: "center" }}>
+								Close
+							</Text>
 						</Pressable>
 					</ScrollView>
 				</View>
