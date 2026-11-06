@@ -1,5 +1,6 @@
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
+import { useMapTheme } from '@/hooks/use-map-theme';
 import type { Condition } from '@/lib/conditions';
 
 type Props = {
@@ -20,34 +21,35 @@ export function MapLegend({
   planeCount,
   planeError,
 }: Props) {
+  const map = useMapTheme();
   if (!condition && planeCount === null) return null;
 
   return (
-    <View style={[styles.card, { bottom }]} pointerEvents="none">
+    <View style={[styles.card, { bottom, backgroundColor: map.panel }]} pointerEvents="none">
       {condition && (
         <View style={styles.section}>
           <View style={styles.titleRow}>
-            <Text style={styles.title}>{condition.label}</Text>
-            {conditionLoading && <ActivityIndicator size="small" color="#f87171" />}
+            <Text style={[styles.title, { color: map.text }]}>{condition.label}</Text>
+            {conditionLoading && <ActivityIndicator size="small" color={map.spinner} />}
           </View>
           <View style={styles.swatches}>
             {condition.legend.map((item) => (
               <View key={item.label} style={styles.swatchItem}>
                 <View style={[styles.swatch, { backgroundColor: item.color }]} />
-                <Text style={styles.swatchLabel}>{item.label}</Text>
+                <Text style={[styles.swatchLabel, { color: map.textBody }]}>{item.label}</Text>
               </View>
             ))}
           </View>
-          <Text style={styles.source}>{condition.source}</Text>
-          {!!conditionError && <Text style={styles.error}>{conditionError}</Text>}
+          <Text style={[styles.source, { color: map.textSubtle }]}>{condition.source}</Text>
+          {!!conditionError && <Text style={[styles.error, { color: map.error }]}>{conditionError}</Text>}
         </View>
       )}
 
       {planeCount !== null && (
         <View style={styles.section}>
-          <Text style={styles.title}>{planeCount.toLocaleString()} aircraft in view</Text>
-          <Text style={styles.source}>Aircraft data: adsb.fi</Text>
-          {!!planeError && <Text style={styles.error}>{planeError}</Text>}
+          <Text style={[styles.title, { color: map.text }]}>{planeCount.toLocaleString()} aircraft in view</Text>
+          <Text style={[styles.source, { color: map.textSubtle }]}>Aircraft data: adsb.fi</Text>
+          {!!planeError && <Text style={[styles.error, { color: map.error }]}>{planeError}</Text>}
         </View>
       )}
     </View>
@@ -61,7 +63,6 @@ const styles = StyleSheet.create({
     // Leaves room for the helper buttons on the right.
     right: 76,
     maxWidth: 320,
-    backgroundColor: '#101820ee',
     borderRadius: 12,
     padding: 10,
     gap: 10,
@@ -75,7 +76,6 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   title: {
-    color: 'white',
     fontWeight: '700',
     fontSize: 14,
   },
@@ -95,15 +95,12 @@ const styles = StyleSheet.create({
     borderRadius: 3,
   },
   swatchLabel: {
-    color: '#e2e8f0',
     fontSize: 11,
   },
   source: {
-    color: '#94a3b8',
     fontSize: 11,
   },
   error: {
-    color: '#fca5a5',
     fontSize: 11,
   },
 });

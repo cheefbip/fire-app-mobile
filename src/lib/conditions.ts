@@ -1,5 +1,5 @@
 import type { SymbolViewProps } from 'expo-symbols';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 
 import { boundsKey, clampBounds, type Bounds } from '@/lib/geo';
@@ -183,16 +183,39 @@ export function getCondition(id: ConditionId | null) {
 }
 
 // ---------------------------------------------------------------------------
-// Grid sampling (Open-Meteo)
+// Grid sampling (Open-Meteo) and hex display
 // ---------------------------------------------------------------------------
+//
+// There are two separate grids:
+//
+// - Samples: the points actually fetched from Open-Meteo. They sit on a square
+//   grid in Web Mercator whose spacing halves at every whole zoom level, so
+//   each level's points are also points of the next level. Zooming in reuses
+//   everything already fetched, and zooming out over an area you've already
+//   seen needs no requests at all.
+//
+// - Hexes: what's drawn. Always HEX_WIDTH_PX wide on screen and rebuilt from
+//   the cached samples as soon as the view changes, without waiting on the
+//   network. Colors blend the nearest samples; numbers and wind arrows show
+//   the single nearest sample, and update once closer samples arrive.
 
-/**
- * Roughly how many whole hexes fit in the view. Partial hexes along the edges
- * are sampled too, so the real request is ~50–65 points (the old 7×7 grid was 49).
- */
-const TARGET_CELLS = 35;
+/** On-screen width of a hex, in points (MapLibre's logical pixels). */
+const HEX_WIDTH_PX = 48;
+/** Sample spacing at a whole zoom level. Between levels it's ~90–180 px. */
+const SAMPLE_SPACING_PX = 128;
+/** ~10 km spacing. Open-Meteo's models aren't finer than that, so stop here. */
+const MAX_SAMPLE_LEVEL = 10;
 /** Open-Meteo's "current" values refresh about every 15 minutes, so polling faster is wasted quota. */
 const POLL_MS = 10 * 60 * 1000;
+/** How often to check for stale samples. Only stale or missing points are requested. */
+const CHECK_MS = 60 * 1000;
+const MAX_POINTS_PER_REQUEST = 100;
+const MAX_CACHED_SAMPLES = 4000;
+/** How many nearby samples blend into a hex's color. */
+const BLEND_NEIGHBORS = 4;
+/** A sample can color hexes up to this many sample spacings away (at the level it was used at). */
+const SAMPLE_REACH = 1;
+
 const FORECAST_URL = 'https://api.open-meteo.com/v1/forecast';
 const AIR_QUALITY_URL = 'https://air-quality-api.open-meteo.com/v1/air-quality';
 
@@ -224,74 +247,79 @@ function colorFor(value: number, stops: Stop[]) {
   return stops[stops.length - 1][1];
 }
 
-type Cell = {
-  lon: number;
-  lat: number;
-  /** Closed ring of the hexagon's 6 corners, [lon, lat]. */
-  ring: [number, number][];
-  /** Center-to-corner distance in degrees of latitude; used to size arrows and labels. */
-  radiusLat: number;
-};
-
-// Hexes are laid out in Web Mercator (the map's own projection) so they look
-// regular on screen at any latitude, then converted back to lon/lat.
-const DEG = Math.PI / 180;
-const toMercY = (lat: number) => Math.log(Math.tan(Math.PI / 4 + (lat * DEG) / 2));
-const fromMercY = (y: number) => (2 * Math.atan(Math.exp(y)) - Math.PI / 2) / DEG;
-const SQRT3 = Math.sqrt(3);
-
-/**
- * Pointy-top hex lattice anchored at mercator (0, 0). The hex size snaps to
- * steps of √2, so panning or small zooms reuse the exact same cells instead
- * of reshuffling them every time the view moves.
- */
-function makeCells(bounds: Bounds): Cell[] {
-  const [w, s, e, n] = clampBounds(bounds);
-  const x0 = w * DEG;
-  const x1 = e * DEG;
-  const y0 = toMercY(s);
-  const y1 = toMercY(n);
-
-  // Hex area is (3√3 / 2)·r², so pick r to fit about TARGET_CELLS in the view.
-  const area = Math.max((x1 - x0) * (y1 - y0), 1e-12);
-  const idealR = Math.sqrt(area / (TARGET_CELLS * 1.5 * SQRT3));
-  const r = Math.SQRT2 ** Math.round(Math.log(idealR) / Math.log(Math.SQRT2));
-  const colStep = SQRT3 * r;
-  const rowStep = 1.5 * r;
-
-  const cells: Cell[] = [];
-  const rowStart = Math.floor(y0 / rowStep) - 1;
-  const rowEnd = Math.ceil(y1 / rowStep) + 1;
-  for (let row = rowStart; row <= rowEnd; row++) {
-    const cy = row * rowStep;
-    const offset = Math.abs(row % 2) === 1 ? colStep / 2 : 0;
-    const colStart = Math.floor((x0 - offset) / colStep) - 1;
-    const colEnd = Math.ceil((x1 - offset) / colStep) + 1;
-    for (let col = colStart; col <= colEnd; col++) {
-      const cx = col * colStep + offset;
-      // Keep hexes that overlap the view at all, so the edges are covered.
-      if (cx < x0 - r || cx > x1 + r || cy < y0 - r || cy > y1 + r) continue;
-
-      const ring: [number, number][] = [];
-      for (let k = 0; k < 6; k++) {
-        const angle = (Math.PI / 3) * k + Math.PI / 6; // pointy top
-        ring.push([(cx + r * Math.cos(angle)) / DEG, fromMercY(cy + r * Math.sin(angle))]);
-      }
-      ring.push(ring[0]);
-
-      const lat = fromMercY(cy);
-      const lon = cx / DEG;
-      if (lat < -85 || lat > 85 || lon < -180 || lon > 180) continue;
-      cells.push({ lon, lat, ring, radiusLat: fromMercY(cy + r) - lat });
-    }
-  }
-  return cells;
+function formatValue(id: ConditionId, value: number) {
+  return id === 'soilMoisture' ? `${Math.round(value * 100)}%` : String(Math.round(value));
 }
 
-async function fetchOpenMeteo(baseUrl: string, cells: Cell[], params: Record<string, string>) {
+// --- Projection -------------------------------------------------------------
+// Everything is laid out in Web Mercator (the map's own projection, in
+// radians) so spacing is even on screen at any latitude.
+
+const DEG = Math.PI / 180;
+const SQRT3 = Math.sqrt(3);
+const toMercY = (lat: number) => Math.log(Math.tan(Math.PI / 4 + (lat * DEG) / 2));
+const fromMercY = (y: number) => (2 * Math.atan(Math.exp(y)) - Math.PI / 2) / DEG;
+const MAX_MERC_Y = toMercY(85);
+
+/** MapLibre draws the whole world 512 points wide at zoom 0, doubling each level. */
+const radiansPerPx = (zoom: number) => (2 * Math.PI) / (512 * 2 ** zoom);
+const sampleStep = (level: number) => SAMPLE_SPACING_PX * radiansPerPx(level);
+
+function sampleLevel(zoom: number) {
+  return Math.min(MAX_SAMPLE_LEVEL, Math.max(0, Math.round(zoom)));
+}
+
+function viewRect(bounds: Bounds) {
+  const [w, s, e, n] = clampBounds(bounds);
+  return { x0: w * DEG, x1: e * DEG, y0: toMercY(s), y1: toMercY(n) };
+}
+
+// --- Samples ----------------------------------------------------------------
+
+type SamplePoint = { key: string; x: number; y: number; lon: number; lat: number };
+
+type Reading = { value: number | null; direction: number | null };
+
+type Sample = SamplePoint &
+  Reading & {
+    /** Coarsest zoom level this point has been used at; sets how far it reaches. */
+    level: number;
+    fetchedAt: number;
+  };
+
+type SampleCache = ReadonlyMap<string, Sample>;
+
+/**
+ * Sample points covering the view at `level`, plus one ring outside it so
+ * hexes at the edges have neighbors to blend with. A point shared by several
+ * levels always gets the same key, so it's only fetched once.
+ */
+function samplePoints(bounds: Bounds, level: number): SamplePoint[] {
+  const { x0, x1, y0, y1 } = viewRect(bounds);
+  const step = sampleStep(level);
+  const points: SamplePoint[] = [];
+  for (let j = Math.floor(y0 / step) - 1; j <= Math.ceil(y1 / step) + 1; j++) {
+    const y = j * step;
+    if (Math.abs(y) > MAX_MERC_Y) continue;
+    for (let i = Math.floor(x0 / step) - 1; i <= Math.ceil(x1 / step) + 1; i++) {
+      const x = i * step;
+      if (Math.abs(x) > Math.PI + 1e-9) continue;
+      let [l, a, b] = [level, i, j];
+      while (l > 0 && a % 2 === 0 && b % 2 === 0) {
+        l--;
+        a /= 2;
+        b /= 2;
+      }
+      points.push({ key: `${l}/${a}/${b}`, x, y, lon: x / DEG, lat: fromMercY(y) });
+    }
+  }
+  return points;
+}
+
+async function fetchOpenMeteo(baseUrl: string, points: SamplePoint[], params: Record<string, string>) {
   const query = new URLSearchParams({
-    latitude: cells.map((c) => c.lat.toFixed(3)).join(','),
-    longitude: cells.map((c) => c.lon.toFixed(3)).join(','),
+    latitude: points.map((p) => p.lat.toFixed(3)).join(','),
+    longitude: points.map((p) => p.lon.toFixed(3)).join(','),
     ...params,
   });
   const response = await fetch(`${baseUrl}?${query.toString()}`);
@@ -300,15 +328,99 @@ async function fetchOpenMeteo(baseUrl: string, cells: Cell[], params: Record<str
   if (data?.error) throw new Error(data.reason || 'Conditions request failed');
   // Multiple coordinates return a list; a single one returns an object.
   const list: any[] = Array.isArray(data) ? data : [data];
-  return list.map((item) => item?.current ?? {});
+  return points.map((_, i) => list[i]?.current ?? {});
 }
 
+const finite = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+async function fetchChunk(condition: GridCondition, points: SamplePoint[]): Promise<Reading[]> {
+  const none = (value: unknown): Reading => ({ value: finite(value), direction: null });
+  switch (condition.id) {
+    case 'wind': {
+      const rows = await fetchOpenMeteo(FORECAST_URL, points, {
+        current: 'wind_speed_10m,wind_direction_10m',
+        wind_speed_unit: 'mph',
+      });
+      return rows.map((r) => ({
+        value: finite(r.wind_speed_10m),
+        direction: finite(r.wind_direction_10m),
+      }));
+    }
+    case 'airQuality': {
+      const rows = await fetchOpenMeteo(AIR_QUALITY_URL, points, { current: 'us_aqi' });
+      return rows.map((r) => none(r.us_aqi));
+    }
+    case 'waterVapor': {
+      const rows = await fetchOpenMeteo(FORECAST_URL, points, {
+        current: 'total_column_integrated_water_vapour',
+      });
+      return rows.map((r) => none(r.total_column_integrated_water_vapour));
+    }
+    case 'soilMoisture': {
+      const rows = await fetchOpenMeteo(FORECAST_URL, points, { current: 'soil_moisture_0_to_1cm' });
+      return rows.map((r) => none(r.soil_moisture_0_to_1cm));
+    }
+    default:
+      return points.map(() => none(null));
+  }
+}
+
+async function fetchReadings(condition: GridCondition, points: SamplePoint[]) {
+  const chunks: SamplePoint[][] = [];
+  for (let k = 0; k < points.length; k += MAX_POINTS_PER_REQUEST) {
+    chunks.push(points.slice(k, k + MAX_POINTS_PER_REQUEST));
+  }
+  const results = await Promise.all(chunks.map((chunk) => fetchChunk(condition, chunk)));
+  return results.flat();
+}
+
+function mergeReadings(
+  cache: SampleCache | undefined,
+  points: SamplePoint[],
+  readings: Reading[],
+  level: number
+): SampleCache {
+  const next = new Map(cache);
+  const now = Date.now();
+  points.forEach((point, i) => {
+    const old = next.get(point.key);
+    next.set(point.key, {
+      ...point,
+      value: readings[i]?.value ?? null,
+      direction: readings[i]?.direction ?? null,
+      level: Math.min(level, old?.level ?? level),
+      fetchedAt: now,
+    });
+  });
+
+  // Drop the oldest samples once the cache gets big.
+  if (next.size > MAX_CACHED_SAMPLES) {
+    const oldest = [...next.values()].sort((a, b) => a.fetchedAt - b.fetchedAt);
+    const drop = next.size - Math.floor(MAX_CACHED_SAMPLES * 0.8);
+    for (const sample of oldest.slice(0, drop)) next.delete(sample.key);
+  }
+  return next;
+}
+
+/** Marks cached points as used at a coarser level, so they reach farther. No request needed. */
+function claimLevel(cache: SampleCache, keys: string[], level: number): SampleCache {
+  const next = new Map(cache);
+  for (const key of keys) {
+    const sample = next.get(key);
+    if (sample && sample.level > level) next.set(key, { ...sample, level });
+  }
+  return next;
+}
+
+// --- Hexes ------------------------------------------------------------------
+
+type HexCenter = { lon: number; lat: number; radiusLat: number };
+
 /** Arrow pointing the way the wind is blowing (Open-Meteo gives the "from" direction). */
-function windArrow(cell: Cell, fromDeg: number): GeoJSON.MultiLineString {
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const bearing = toRad((fromDeg + 180) % 360);
+function windArrow(cell: HexCenter, fromDeg: number): GeoJSON.MultiLineString {
+  const bearing = ((fromDeg + 180) % 360) * DEG;
   const len = cell.radiusLat * 0.55;
-  const k = 1 / Math.cos(toRad(cell.lat)); // keep arrows from stretching east-west
+  const k = 1 / Math.cos(cell.lat * DEG); // keep arrows from stretching east-west
   const point = (b: number, d: number, from: [number, number]): [number, number] => [
     from[0] + Math.sin(b) * d * k,
     from[1] + Math.cos(b) * d,
@@ -327,146 +439,229 @@ function windArrow(cell: Cell, fromDeg: number): GeoJSON.MultiLineString {
   };
 }
 
-async function loadGrid(condition: GridCondition, bounds: Bounds): Promise<GridCollection> {
-  const cells = makeCells(bounds);
-  let values: (number | null)[] = [];
-  let directions: (number | null)[] = [];
-  let format = (v: number) => String(Math.round(v));
+type Neighbor = { sample: Sample; d2: number; reach2: number };
 
-  switch (condition.id) {
-    case 'wind': {
-      const rows = await fetchOpenMeteo(FORECAST_URL, cells, {
-        current: 'wind_speed_10m,wind_direction_10m',
-        wind_speed_unit: 'mph',
-      });
-      values = rows.map((r) => r.wind_speed_10m ?? null);
-      directions = rows.map((r) => r.wind_direction_10m ?? null);
-      format = (v) => `${Math.round(v)}`;
-      break;
-    }
-    case 'airQuality': {
-      const rows = await fetchOpenMeteo(AIR_QUALITY_URL, cells, { current: 'us_aqi' });
-      values = rows.map((r) => r.us_aqi ?? null);
-      break;
-    }
-    case 'waterVapor': {
-      const rows = await fetchOpenMeteo(FORECAST_URL, cells, {
-        current: 'total_column_integrated_water_vapour',
-      });
-      values = rows.map((r) => r.total_column_integrated_water_vapour ?? null);
-      break;
-    }
-    case 'soilMoisture': {
-      const rows = await fetchOpenMeteo(FORECAST_URL, cells, { current: 'soil_moisture_0_to_1cm' });
-      values = rows.map((r) => r.soil_moisture_0_to_1cm ?? null);
-      format = (v) => `${Math.round(v * 100)}%`;
-      break;
-    }
+/**
+ * Pointy-top hexes HEX_WIDTH_PX wide at `zoom`, anchored at mercator (0, 0)
+ * so panning reuses the same cells. Each hex is colored by blending the
+ * nearest cached samples (inverse-distance weighted) and labeled with the
+ * single nearest sample's value. Hexes with no sample in reach are left out
+ * until data for them arrives.
+ */
+function buildGrid(
+  condition: GridCondition,
+  cache: SampleCache | undefined,
+  bounds: Bounds,
+  zoom: number
+): GridCollection {
+  if (!cache?.size) return EMPTY_GRID;
+  const { x0, x1, y0, y1 } = viewRect(bounds);
+
+  // Only samples that can reach the view take part.
+  const nearby: { sample: Sample; reach2: number }[] = [];
+  for (const sample of cache.values()) {
+    if (sample.value == null) continue;
+    const reach = sampleStep(sample.level) * SAMPLE_REACH;
+    if (sample.x < x0 - reach || sample.x > x1 + reach) continue;
+    if (sample.y < y0 - reach || sample.y > y1 + reach) continue;
+    nearby.push({ sample, reach2: reach * reach });
   }
+  if (!nearby.length) return EMPTY_GRID;
 
+  const r = (HEX_WIDTH_PX / SQRT3) * radiansPerPx(zoom);
+  const colStep = SQRT3 * r;
+  const rowStep = 1.5 * r;
   const features: GridCollection['features'] = [];
-  cells.forEach((cell, i) => {
-    const value = values[i];
-    if (value == null || !Number.isFinite(value)) return;
-    const color = colorFor(value, condition.stops);
-    const label = format(value);
 
-    features.push({
-      type: 'Feature',
-      geometry: {
-        type: 'Polygon',
-        coordinates: [cell.ring],
-      },
-      properties: { kind: 'cell', color, label },
-    });
+  for (let row = Math.floor(y0 / rowStep) - 1; row <= Math.ceil(y1 / rowStep) + 1; row++) {
+    const cy = row * rowStep;
+    if (Math.abs(cy) > MAX_MERC_Y) continue;
+    const offset = Math.abs(row % 2) === 1 ? colStep / 2 : 0;
+    for (
+      let col = Math.floor((x0 - offset) / colStep) - 1;
+      col <= Math.ceil((x1 - offset) / colStep) + 1;
+      col++
+    ) {
+      const cx = col * colStep + offset;
+      if (cx < x0 - r || cx > x1 + r || cy < y0 - r || cy > y1 + r) continue;
+      if (Math.abs(cx) > Math.PI) continue;
 
-    const dir = directions[i];
-    if (dir != null && Number.isFinite(dir)) {
+      // The few nearest samples, closest first.
+      const best: Neighbor[] = [];
+      for (const { sample, reach2 } of nearby) {
+        const dx = sample.x - cx;
+        const dy = sample.y - cy;
+        const d2 = dx * dx + dy * dy;
+        if (best.length === BLEND_NEIGHBORS && d2 >= best[best.length - 1].d2) continue;
+        let at = best.length;
+        while (at > 0 && best[at - 1].d2 > d2) at--;
+        best.splice(at, 0, { sample, d2, reach2 });
+        if (best.length > BLEND_NEIGHBORS) best.pop();
+      }
+      if (!best.some((n) => n.d2 <= n.reach2)) continue;
+
+      // Blend for color; nearest for the number and arrow.
+      const nearest = best[0].sample;
+      let blended = nearest.value!;
+      if (best[0].d2 > 1e-18) {
+        let sum = 0;
+        let weights = 0;
+        for (const n of best) {
+          const w = 1 / n.d2;
+          sum += n.sample.value! * w;
+          weights += w;
+        }
+        blended = sum / weights;
+      }
+      const color = colorFor(blended, condition.stops);
+      const label = formatValue(condition.id, nearest.value!);
+
+      const ring: [number, number][] = [];
+      for (let k = 0; k < 6; k++) {
+        const angle = (Math.PI / 3) * k + Math.PI / 6; // pointy top
+        ring.push([(cx + r * Math.cos(angle)) / DEG, fromMercY(cy + r * Math.sin(angle))]);
+      }
+      ring.push(ring[0]);
+      const lat = fromMercY(cy);
+      const center: HexCenter = { lon: cx / DEG, lat, radiusLat: fromMercY(cy + r) - lat };
+
       features.push({
         type: 'Feature',
-        geometry: windArrow(cell, dir),
-        properties: { kind: 'arrow', color, label },
+        geometry: { type: 'Polygon', coordinates: [ring] },
+        properties: { kind: 'cell', color, label },
+      });
+
+      const dir = nearest.direction;
+      if (dir != null) {
+        features.push({
+          type: 'Feature',
+          geometry: windArrow(center, dir),
+          properties: { kind: 'arrow', color, label },
+        });
+      }
+
+      // Wind labels sit just below the arrow so they don't overlap it.
+      const labelLat = dir != null ? lat - center.radiusLat * 0.6 : lat;
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [center.lon, labelLat] },
+        properties: { kind: 'label', color, label },
       });
     }
-
-    // Wind labels sit just below the arrow so they don't overlap it.
-    const labelLat = dir != null ? cell.lat - cell.radiusLat * 0.6 : cell.lat;
-    features.push({
-      type: 'Feature',
-      geometry: { type: 'Point', coordinates: [cell.lon, labelLat] },
-      properties: { kind: 'label', color, label },
-    });
-  });
+  }
 
   return { type: 'FeatureCollection', features };
 }
 
+// --- Hook -------------------------------------------------------------------
+
 /**
- * Loads the hex grid for the active condition. Refetches when the view moves,
- * and polls every POLL_MS while the app is open.
+ * Hex grid for the active condition. Hexes are redrawn from cached samples
+ * right away whenever the view changes; missing samples are fetched after a
+ * short pause, and stale ones (older than POLL_MS) are refreshed while the
+ * app is open. Samples are kept per condition, so switching back is instant.
  */
-export function useConditionGrid(condition: Condition | null, bounds: Bounds) {
-  // Each piece of state remembers which condition it belongs to. Switching
-  // conditions hides the old cells and errors right away (they don't match the
-  // new id), while panning keeps the cells on screen until new data arrives.
-  const [grid, setGrid] = useState<{ id: ConditionId; data: GridCollection } | null>(null);
-  const [loadingId, setLoadingId] = useState<ConditionId | null>(null);
+export function useConditionGrid(condition: Condition | null, bounds: Bounds, zoom: number) {
+  const [caches, setCaches] = useState<Partial<Record<ConditionId, SampleCache>>>({});
+  const [pending, setPending] = useState<Partial<Record<ConditionId, number>>>({});
   const [error, setError] = useState<{ id: ConditionId; message: string } | null>(null);
-  const key = boundsKey(bounds);
+  const inFlight = useRef(new Set<string>());
+
   const gridCondition = condition?.kind === 'grid' ? condition : null;
   const id = gridCondition?.id ?? null;
+  const level = sampleLevel(zoom);
+  const key = boundsKey(bounds);
+
+  // Timers and listeners outlive the render that set them up, so they read
+  // the latest view and cache from here.
+  const latest = useRef({ bounds, caches });
+  useEffect(() => {
+    latest.current = { bounds, caches };
+  });
 
   useEffect(() => {
     if (!gridCondition) return;
-
     const conditionId = gridCondition.id;
-    let cancelled = false;
-    let lastLoaded = 0;
 
-    // `quiet` refreshes keep the current cells and skip the spinner.
-    const load = async (quiet: boolean) => {
-      if (!quiet) setLoadingId(conditionId);
+    const sync = async () => {
+      const cache = latest.current.caches[conditionId];
+      const now = Date.now();
+      const claim: string[] = [];
+      const missing: SamplePoint[] = [];
+      const stale: SamplePoint[] = [];
+
+      for (const point of samplePoints(latest.current.bounds, level)) {
+        if (inFlight.current.has(`${conditionId}|${point.key}`)) continue;
+        const sample = cache?.get(point.key);
+        if (!sample) {
+          missing.push(point);
+          continue;
+        }
+        if (now - sample.fetchedAt >= POLL_MS) stale.push(point);
+        if (sample.level > level) claim.push(point.key);
+      }
+
+      if (claim.length) {
+        setCaches((prev) => {
+          const current = prev[conditionId];
+          return current ? { ...prev, [conditionId]: claimLevel(current, claim, level) } : prev;
+        });
+      }
+
+      const toFetch = [...missing, ...stale];
+      if (!toFetch.length) return;
+      const flightKeys = toFetch.map((p) => `${conditionId}|${p.key}`);
+      flightKeys.forEach((k) => inFlight.current.add(k));
+
+      // The spinner is for new areas only; background refreshes stay quiet.
+      const showSpinner = missing.length > 0;
+      const bump = (by: number) =>
+        setPending((prev) => ({ ...prev, [conditionId]: (prev[conditionId] ?? 0) + by }));
+      if (showSpinner) bump(1);
+
       try {
-        const result = await loadGrid(gridCondition, bounds);
-        if (cancelled) return;
-        setGrid({ id: conditionId, data: result });
-        setError(null);
-        lastLoaded = Date.now();
+        const readings = await fetchReadings(gridCondition, toFetch);
+        setCaches((prev) => ({
+          ...prev,
+          [conditionId]: mergeReadings(prev[conditionId], toFetch, readings, level),
+        }));
+        setError((prev) => (prev?.id === conditionId ? null : prev));
       } catch (e) {
-        if (cancelled) return;
         const message = e instanceof Error ? e.message : 'Unable to load conditions';
         setError({ id: conditionId, message });
       } finally {
-        if (!cancelled && !quiet) setLoadingId(null);
+        flightKeys.forEach((k) => inFlight.current.delete(k));
+        if (showSpinner) bump(-1);
       }
     };
 
-    // Short debounce so a pan doesn't fire a request per frame.
-    const debounce = setTimeout(() => load(false), 500);
-
-    // Poll while the app is in the foreground only.
-    const poll = setInterval(() => {
-      if (AppState.currentState === 'active') load(true);
-    }, POLL_MS);
-
-    // Coming back to the app after a while refreshes right away.
+    // Short pause so a burst of pans sends one request.
+    const debounce = setTimeout(sync, 400);
+    const check = setInterval(() => {
+      if (AppState.currentState === 'active') sync();
+    }, CHECK_MS);
     const appState = AppState.addEventListener('change', (state) => {
-      if (state === 'active' && lastLoaded && Date.now() - lastLoaded >= POLL_MS) load(true);
+      if (state === 'active') sync();
     });
 
     return () => {
-      cancelled = true;
       clearTimeout(debounce);
-      clearInterval(poll);
+      clearInterval(check);
       appState.remove();
     };
-    // `key` stands in for `bounds` so small pans don't refetch.
+    // `key` stands in for `bounds` so tiny pans don't refetch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, key]);
+  }, [id, key, level]);
+
+  const cache = id ? caches[id] : undefined;
+  const grid = useMemo(
+    () => (gridCondition ? buildGrid(gridCondition, cache, bounds, zoom) : EMPTY_GRID),
+    [gridCondition, cache, bounds, zoom]
+  );
 
   return {
-    grid: id && grid?.id === id ? grid.data : EMPTY_GRID,
-    loading: id != null && loadingId === id,
+    grid,
+    loading: id != null && (pending[id] ?? 0) > 0,
     error: id && error?.id === id ? error.message : '',
   };
 }

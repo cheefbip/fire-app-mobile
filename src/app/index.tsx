@@ -22,6 +22,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MapHelper } from "@/components/map/map-helper";
 import { MapLegend } from "@/components/map/map-legend";
 import { BottomTabInset } from "@/constants/theme";
+import { useMapTheme } from "@/hooks/use-map-theme";
 import { useAircraft } from "@/lib/aircraft";
 import {
 	getCondition,
@@ -545,6 +546,7 @@ function readableContainment(value: unknown): string {
 
 export default function HomeScreen() {
 	const insets = useSafeAreaInsets();
+	const map = useMapTheme();
 	const [hours, setHours] = useState(24);
 	const [fires, setFires] = useState<FireCollection>(EMPTY_DATA);
 	const [perimeters, setPerimeters] =
@@ -558,6 +560,8 @@ export default function HomeScreen() {
 
 	// Map helper state
 	const [bounds, setBounds] = useState<Bounds>(DEFAULT_BOUNDS);
+	// Matches the Camera's initial zoom below.
+	const [zoom, setZoom] = useState(3);
 	const [showPlanes, setShowPlanes] = useState(false);
 	const [showFires, setShowFires] = useState(true);
 	const [conditionId, setConditionId] = useState<ConditionId | null>(null);
@@ -569,7 +573,7 @@ export default function HomeScreen() {
 		grid,
 		loading: gridLoading,
 		error: gridError,
-	} = useConditionGrid(condition, bounds);
+	} = useConditionGrid(condition, bounds, zoom);
 
 	// Keeps floating UI just above the bottom tab bar.
 	const bottomOffset = insets.bottom + BottomTabInset + 12;
@@ -622,12 +626,16 @@ export default function HomeScreen() {
 	const selectedProperties = selected?.properties;
 
 	return (
-		<View style={{ flex: 1, backgroundColor: "#101820" }}>
+		<View style={{ flex: 1, backgroundColor: map.screen }}>
 			<Map
 				style={{ flex: 1 }}
-				mapStyle="https://tiles.openfreemap.org/styles/liberty"
+				mapStyle={map.basemap}
 				onPress={() => setSelected(null)}
-				onRegionDidChange={(event) => setBounds(event.nativeEvent.bounds)}
+				onRegionDidChange={(event) => {
+					setBounds(event.nativeEvent.bounds);
+					// Rounded so float noise on a pure pan doesn't reshuffle the hexes.
+					setZoom(Math.round(event.nativeEvent.zoom * 1000) / 1000);
+				}}
 				dragPan={true}
 				touchZoom={true}
 				doubleTapHoldZoom={false}
@@ -766,8 +774,8 @@ export default function HomeScreen() {
 							filter={["==", ["get", "kind"], "cell"]}
 							paint={{
 								"fill-color": ["get", "color"],
-								"fill-opacity": 0.38,
-								"fill-outline-color": "#ffffff22",
+								"fill-opacity": map.gridOpacity,
+								"fill-outline-color": map.border,
 							}}
 						/>
 						<Layer
@@ -776,7 +784,7 @@ export default function HomeScreen() {
 							type="line"
 							filter={["==", ["get", "kind"], "arrow"]}
 							layout={{ "line-cap": "round", "line-join": "round" }}
-							paint={{ "line-color": "#0f172a", "line-width": 2.5 }}
+							paint={{ "line-color": map.mapLabel, "line-width": 2.5 }}
 						/>
 						<Layer
 							id="condition-grid-labels"
@@ -790,8 +798,8 @@ export default function HomeScreen() {
 								"text-allow-overlap": true,
 							}}
 							paint={{
-								"text-color": "#0f172a",
-								"text-halo-color": "#ffffffcc",
+								"text-color": map.mapLabel,
+								"text-halo-color": map.mapLabelHalo,
 								"text-halo-width": 1.5,
 							}}
 						/>
@@ -819,8 +827,8 @@ export default function HomeScreen() {
 							"text-optional": true,
 						}}
 						paint={{
-							"text-color": "#0f172a",
-							"text-halo-color": "#ffffffdd",
+							"text-color": map.mapLabel,
+							"text-halo-color": map.mapLabelHalo,
 							"text-halo-width": 1.2,
 						}}
 					/>
@@ -835,14 +843,14 @@ export default function HomeScreen() {
 					right: 16,
 					padding: 14,
 					borderRadius: 14,
-					backgroundColor: "#101820ee",
+					backgroundColor: map.panel,
 				}}
 			>
-				<Text style={{ color: "white", fontSize: 21, fontWeight: "bold" }}>
+				<Text style={{ color: map.text, fontSize: 21, fontWeight: "bold" }}>
 					Ignis
 				</Text>
 
-				<Text style={{ color: "#cbd5e1", marginTop: 4 }}>
+				<Text style={{ color: map.textMuted, marginTop: 4 }}>
 					{loading
 						? "Loading satellite detections..."
 						: `${fires.features.length.toLocaleString()} hotspots${showFires ? "" : " (hidden)"} • ${perimeters.features.length.toLocaleString()} perimeter features`}
@@ -860,10 +868,15 @@ export default function HomeScreen() {
 								paddingVertical: 8,
 								paddingHorizontal: 13,
 								borderRadius: 8,
-								backgroundColor: hours === value ? "#dc2626" : "#334155",
+								backgroundColor: hours === value ? map.active : map.button,
 							}}
 						>
-							<Text style={{ color: "white", fontWeight: "600" }}>
+							<Text
+								style={{
+									color: hours === value ? map.onActive : map.text,
+									fontWeight: "600",
+								}}
+							>
 								{value === 168 ? "7 days" : `${value} hours`}
 							</Text>
 						</Pressable>
@@ -874,22 +887,22 @@ export default function HomeScreen() {
 						style={{
 							padding: 8,
 							borderRadius: 8,
-							backgroundColor: "#475569",
+							backgroundColor: map.buttonStrong,
 						}}
 					>
-						<Text style={{ color: "white" }}>Refresh</Text>
+						<Text style={{ color: map.text }}>Refresh</Text>
 					</Pressable>
 				</View>
 
 				{loading && (
 					<ActivityIndicator
-						color="#f87171"
+						color={map.spinner}
 						style={{ marginTop: 10, alignSelf: "flex-start" }}
 					/>
 				)}
 
 				{!!error && (
-					<Text style={{ color: "#fca5a5", marginTop: 8 }}>{error}</Text>
+					<Text style={{ color: map.error, marginTop: 8 }}>{error}</Text>
 				)}
 			</View>
 
@@ -923,7 +936,7 @@ export default function HomeScreen() {
 						left: 16,
 						right: 76,
 						maxHeight: "45%",
-						backgroundColor: "#101820f5",
+						backgroundColor: map.panelSolid,
 						borderRadius: 14,
 						padding: 16,
 					}}
@@ -931,7 +944,7 @@ export default function HomeScreen() {
 					<ScrollView>
 						<Text
 							style={{
-								color: "white",
+								color: map.text,
 								fontSize: 20,
 								fontWeight: "bold",
 							}}
@@ -942,22 +955,22 @@ export default function HomeScreen() {
 							)}
 						</Text>
 
-						<Text style={{ color: "#ffd166", marginTop: 6 }}>
+						<Text style={{ color: map.accent, marginTop: 6 }}>
 							Reported wildfire boundary
 						</Text>
 
-						<Text style={{ color: "#e2e8f0", marginTop: 16 }}>
+						<Text style={{ color: map.textBody, marginTop: 16 }}>
 							Classification: Reported wildfire
 						</Text>
 
-						<Text style={{ color: "#e2e8f0", marginTop: 12 }}>
+						<Text style={{ color: map.textBody, marginTop: 12 }}>
 							Reported containment:{" "}
 							{readableContainment(
 								selectedPerimeter.properties.attr_PercentContained
 							)}
 						</Text>
 
-						<Text style={{ color: "#e2e8f0", marginTop: 12 }}>
+						<Text style={{ color: map.textBody, marginTop: 12 }}>
 							Incident record updated:
 							{"\n"}
 							{readableObservation(
@@ -967,7 +980,7 @@ export default function HomeScreen() {
 							)}
 						</Text>
 
-						<Text style={{ color: "#e2e8f0", marginTop: 12 }}>
+						<Text style={{ color: map.textBody, marginTop: 12 }}>
 							Reported out date:
 							{"\n"}
 							{readableObservation(
@@ -977,12 +990,12 @@ export default function HomeScreen() {
 							)}
 						</Text>
 
-						<Text style={{ color: "#94a3b8", marginTop: 12 }}>
+						<Text style={{ color: map.textSubtle, marginTop: 12 }}>
 							Containment is not the same as extinguishment.
 							A missing out date does not confirm current burning.
 						</Text>
 
-						<Text style={{ color: "#e2e8f0", marginTop: 16 }}>
+						<Text style={{ color: map.textBody, marginTop: 16 }}>
 							Boundary captured:
 							{"\n"}
 							{readableObservation(
@@ -992,12 +1005,12 @@ export default function HomeScreen() {
 							)}
 						</Text>
 
-						<Text style={{ color: "#94a3b8", marginTop: 12 }}>
+						<Text style={{ color: map.textSubtle, marginTop: 12 }}>
 							This is the reported mapped fire extent. It does not
 							mean the entire area is currently burning.
 						</Text>
 
-						<Text style={{ color: "#cbd5e1", marginTop: 12 }}>
+						<Text style={{ color: map.textMuted, marginTop: 12 }}>
 							Boundary source: NIFC / WFIGS
 						</Text>
 
@@ -1007,10 +1020,10 @@ export default function HomeScreen() {
 								marginTop: 16,
 								padding: 12,
 								borderRadius: 8,
-								backgroundColor: "#334155",
+								backgroundColor: map.button,
 							}}
 						>
-							<Text style={{ color: "white", textAlign: "center" }}>
+							<Text style={{ color: map.text, textAlign: "center" }}>
 								Close
 							</Text>
 						</Pressable>
@@ -1025,17 +1038,17 @@ export default function HomeScreen() {
 						bottom: bottomOffset,
 						left: 16,
 						right: 76,
-						backgroundColor: "#101820f5",
+						backgroundColor: map.panelSolid,
 						borderRadius: 14,
 						padding: 16,
 					}}
 				>
 					<ScrollView>
-						<Text style={{ color: "white", fontSize: 18, fontWeight: "bold" }}>
+						<Text style={{ color: map.text, fontSize: 18, fontWeight: "bold" }}>
 							Hotspot details
 						</Text>
 
-						<Text style={{ color: "#e2e8f0", marginTop: 8 }}>
+						<Text style={{ color: map.textBody, marginTop: 8 }}>
 							Satellite observation:
 							{"\n"}
 							{readableObservation(selectedProperties.detected)}
@@ -1044,12 +1057,12 @@ export default function HomeScreen() {
 							{"\n"}Detection confidence: {selectedProperties.confidence}
 						</Text>
 
-						<Text style={{ color: "#94a3b8", marginTop: 8 }}>
+						<Text style={{ color: map.textSubtle, marginTop: 8 }}>
 							Confidence describes the quality of the satellite heat
 							detection. It is not a wildfire risk rating.
 						</Text>
 
-						<Text style={{ color: "#94a3b8", marginTop: 8 }}>
+						<Text style={{ color: map.textSubtle, marginTop: 8 }}>
 							This detection falls within a reported wildfire perimeter.
 							It does not establish that the location is still burning.
 						</Text>
@@ -1058,13 +1071,13 @@ export default function HomeScreen() {
 							onPress={() => setShowTechnical((current) => !current)}
 							style={{ marginTop: 12, paddingVertical: 8 }}
 						>
-							<Text style={{ color: "#ffd166", fontWeight: "600" }}>
+							<Text style={{ color: map.accent, fontWeight: "600" }}>
 								{showTechnical ? "Hide technical details" : "Show technical details"}
 							</Text>
 						</Pressable>
 
 						{showTechnical && (
-							<Text style={{ color: "#cbd5e1", marginTop: 8 }}>
+							<Text style={{ color: map.textMuted, marginTop: 8 }}>
 								Coordinates: {selected?.geometry.coordinates[1].toFixed(5)},{" "}
 								{selected?.geometry.coordinates[0].toFixed(5)}
 
@@ -1093,11 +1106,11 @@ export default function HomeScreen() {
 							style={{
 								marginTop: 12,
 								padding: 10,
-								backgroundColor: "#334155",
+								backgroundColor: map.button,
 								borderRadius: 8,
 							}}
 						>
-							<Text style={{ color: "white", textAlign: "center" }}>Close</Text>
+							<Text style={{ color: map.text, textAlign: "center" }}>Close</Text>
 						</Pressable>
 					</ScrollView>
 				</View>

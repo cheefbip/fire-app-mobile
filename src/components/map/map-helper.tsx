@@ -2,6 +2,7 @@ import { SymbolView, type SymbolViewProps } from 'expo-symbols';
 import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
+import { useMapTheme } from '@/hooks/use-map-theme';
 import { CONDITIONS, type ConditionId } from '@/lib/conditions';
 
 type Props = {
@@ -15,9 +16,6 @@ type Props = {
   /** Lets the screen hide other overlays while the conditions menu is open. */
   onExpandedChange?: (expanded: boolean) => void;
 };
-
-const ACTIVE = '#dc2626';
-const IDLE = '#101820ee';
 
 /**
  * Floating map controls, bottom-right just above the tab bar:
@@ -33,6 +31,7 @@ export function MapHelper({
   onSelectCondition,
   onExpandedChange,
 }: Props) {
+  const map = useMapTheme();
   const [expanded, setExpandedState] = useState(false);
 
   const setExpanded = (value: boolean) => {
@@ -53,8 +52,8 @@ export function MapHelper({
   return (
     <View style={[styles.root, { bottom }]} pointerEvents="box-none">
       {expanded && (
-        <View style={styles.menu}>
-          <Text style={styles.menuTitle}>Area conditions</Text>
+        <View style={[styles.menu, { backgroundColor: map.panelSolid, borderColor: map.border }]}>
+          <Text style={[styles.menuTitle, { color: map.textSubtle }]}>Area conditions</Text>
           {CONDITIONS.map((c) => {
             const active = condition === c.id;
             return (
@@ -65,24 +64,29 @@ export function MapHelper({
                 accessibilityState={{ selected: active }}
                 style={({ pressed }) => [
                   styles.menuItem,
-                  active && styles.menuItemActive,
+                  active && { backgroundColor: map.active },
                   pressed && styles.pressed,
                 ]}>
-                <SymbolView name={c.icon} size={18} tintColor="white" />
-                <Text style={styles.menuLabel}>{c.label}</Text>
+                <SymbolView name={c.icon} size={18} tintColor={active ? map.onActive : map.text} />
+                <Text style={[styles.menuLabel, { color: active ? map.onActive : map.text }]}>{c.label}</Text>
               </Pressable>
             );
           })}
           <Pressable
             onPress={clear}
             accessibilityRole="button"
-            style={({ pressed }) => [styles.menuItem, styles.clearItem, pressed && styles.pressed]}>
+            style={({ pressed }) => [
+              styles.menuItem,
+              styles.clearItem,
+              { borderTopColor: map.divider },
+              pressed && styles.pressed,
+            ]}>
             <SymbolView
               name={{ ios: 'xmark.circle', android: 'layers_clear', web: 'layers_clear' }}
               size={18}
-              tintColor="#fca5a5"
+              tintColor={map.error}
             />
-            <Text style={[styles.menuLabel, { color: '#fca5a5' }]}>Clear</Text>
+            <Text style={[styles.menuLabel, { color: map.error }]}>Clear</Text>
           </Pressable>
         </View>
       )}
@@ -122,6 +126,7 @@ function HelperButton({
   active: boolean;
   onPress: () => void;
 }) {
+  const map = useMapTheme();
   return (
     <Pressable
       onPress={onPress}
@@ -131,10 +136,10 @@ function HelperButton({
       hitSlop={4}
       style={({ pressed }) => [
         styles.button,
-        { backgroundColor: active ? ACTIVE : IDLE },
+        { backgroundColor: active ? map.active : map.panel, borderColor: map.border },
         pressed && styles.pressed,
       ]}>
-      <SymbolView name={icon} size={22} tintColor="white" />
+      <SymbolView name={icon} size={22} tintColor={active ? map.onActive : map.text} />
     </Pressable>
   );
 }
@@ -157,7 +162,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: '#ffffff22',
     shadowColor: '#000',
     shadowOpacity: 0.3,
     shadowRadius: 4,
@@ -165,16 +169,13 @@ const styles = StyleSheet.create({
     elevation: 4,
   },
   menu: {
-    backgroundColor: '#101820f2',
     borderRadius: 14,
     padding: 8,
     gap: 2,
     minWidth: 170,
     borderWidth: 1,
-    borderColor: '#ffffff22',
   },
   menuTitle: {
-    color: '#94a3b8',
     fontSize: 12,
     fontWeight: '600',
     paddingHorizontal: 8,
@@ -189,17 +190,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     borderRadius: 10,
   },
-  menuItemActive: {
-    backgroundColor: ACTIVE,
-  },
   clearItem: {
     marginTop: 4,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#ffffff33',
     borderRadius: 0,
   },
   menuLabel: {
-    color: 'white',
     fontSize: 15,
   },
   pressed: {
