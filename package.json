@@ -5,6 +5,8 @@
   "dependencies": {
     "@expo/ui": "~57.0.20",
     "@maplibre/maplibre-react-native": "^11.4.1",
+    "@turf/bbox": "^7.4.0",
+    "@turf/boolean-point-in-polygon": "^7.4.0",
     "expo": "~57.0.25",
     "expo-constants": "~57.0.19",
     "expo-device": "~57.0.2",
