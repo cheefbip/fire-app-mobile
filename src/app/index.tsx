@@ -12,6 +12,7 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import {
 	ActivityIndicator,
+	Platform,
 	Pressable,
 	ScrollView,
 	Text,
@@ -563,8 +564,11 @@ export default function HomeScreen() {
 	// re-renders only the overlay, not this whole screen.
 	const [viewStore] = useState(() => createMapViewStore(INITIAL_VIEW));
 
-	// Keeps floating UI just above the bottom tab bar.
-	const bottomOffset = insets.bottom + BottomTabInset + 12;
+	// Keeps floating UI just above the bottom tab bar. Android's tab bar sits
+	// below the map, so only a small margin is needed; on iOS and web the tab
+	// bar overlaps the map, so clear it too.
+	const bottomOffset =
+		Platform.OS === "android" ? 12 : insets.bottom + BottomTabInset + 12;
 
 	const refresh = useCallback(async () => {
 		setLoading(true);
@@ -635,6 +639,11 @@ export default function HomeScreen() {
 				touchRotate={false}
 				touchPitch={false}
 				doubleTapHoldZoom={false}
+				// On Android the map buttons sit in the bottom-right corner, so move
+				// the attribution (i) button next to the MapLibre logo on the left.
+				attributionPosition={
+					Platform.OS === "android" ? { bottom: 8, left: 104 } : undefined
+				}
 			>
 				<GeoJSONSource
 					id="wildfire-perimeters"
