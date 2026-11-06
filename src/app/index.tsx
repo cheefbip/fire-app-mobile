@@ -1,17 +1,31 @@
 import {
-  Camera,
-  GeoJSONSource,
-  Layer,
-  Map,
+	Camera,
+	GeoJSONSource,
+	Images,
+	Layer,
+	Map,
+	RasterSource,
 } from "@maplibre/maplibre-react-native";
 import { useCallback, useEffect, useState } from "react";
 import {
-  ActivityIndicator,
-  Pressable,
-  ScrollView,
-  Text,
-  View,
+	ActivityIndicator,
+	Pressable,
+	ScrollView,
+	Text,
+	View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+import { MapHelper } from "@/components/map/map-helper";
+import { MapLegend } from "@/components/map/map-legend";
+import { BottomTabInset } from "@/constants/theme";
+import { useAircraft } from "@/lib/aircraft";
+import {
+	getCondition,
+	useConditionGrid,
+	type ConditionId,
+} from "@/lib/conditions";
+import { DEFAULT_BOUNDS, type Bounds } from "@/lib/geo";
 
 const MAPTILER_API_KEY = process.env.EXPO_PUBLIC_MAPTILER_API_KEY;
 
@@ -136,11 +150,30 @@ function formatTime(value: number | null) {
 }
 
 export default function HomeScreen() {
+	const insets = useSafeAreaInsets();
 	const [hours, setHours] = useState(24);
 	const [fires, setFires] = useState<FireCollection>(EMPTY_DATA);
 	const [selected, setSelected] = useState<Hotspot | null>(null);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
+
+	// Map helper state
+	const [bounds, setBounds] = useState<Bounds>(DEFAULT_BOUNDS);
+	const [showPlanes, setShowPlanes] = useState(false);
+	const [showFires, setShowFires] = useState(true);
+	const [conditionId, setConditionId] = useState<ConditionId | null>(null);
+	const [helperExpanded, setHelperExpanded] = useState(false);
+
+	const condition = getCondition(conditionId);
+	const { aircraft, error: aircraftError } = useAircraft(showPlanes, bounds);
+	const {
+		grid,
+		loading: gridLoading,
+		error: gridError,
+	} = useConditionGrid(condition, bounds);
+
+	// Keeps floating UI just above the bottom tab bar.
+	const bottomOffset = insets.bottom + BottomTabInset + 12;
 
 	const refresh = useCallback(async () => {
 		setLoading(true);
@@ -164,10 +197,13 @@ export default function HomeScreen() {
 	}, [hours]);
 
 	useEffect(() => {
-		refresh();
-
+		// Deferred a tick so refresh's setState calls run outside the effect body.
+		const first = setTimeout(refresh, 0);
 		const timer = setInterval(refresh, 5 * 60 * 1000);
-		return () => clearInterval(timer);
+		return () => {
+			clearTimeout(first);
+			clearInterval(timer);
+		};
 	}, [refresh]);
 
 	const selectedProperties = selected?.properties;
@@ -178,21 +214,26 @@ export default function HomeScreen() {
 				style={{ flex: 1 }}
 				mapStyle="https://tiles.openfreemap.org/styles/liberty"
 				onPress={() => setSelected(null)}
+				onRegionDidChange={(event) => setBounds(event.nativeEvent.bounds)}
 			>
-				<Camera centerCoordinate={[-119.4179, 36.7783]} zoomLevel={5} />
+				<Camera initialViewState={{ center: [-119.4179, 36.7783], zoom: 5 }} />
 
+				<Images images={{ plane: require("@/assets/images/map/plane.png") }} />
+
+				{/* Fires stay mounted so condition layers can sit underneath them. */}
 				<GeoJSONSource
 					id="fire-hotspots"
 					data={fires}
-					cluster={true}
+					cluster={false}
 					clusterRadius={35}
 				>
 					<Layer
 						id="fire-hotspot-circles"
 						type="circle"
-						style={{
-							circleColor: "#ff3b30",
-							circleRadius: [
+						layout={{ visibility: showFires ? "visible" : "none" }}
+						paint={{
+							"circle-color": "#ff3b30",
+							"circle-radius": [
 								"interpolate",
 								["linear"],
 								["zoom"],
@@ -203,9 +244,96 @@ export default function HomeScreen() {
 								12,
 								7,
 							],
-							circleOpacity: 0.85,
-							circleStrokeColor: "#ffd166",
-							circleStrokeWidth: 0.8,
+							"circle-opacity": 0.85,
+							"circle-stroke-color": "#ffd166",
+							"circle-stroke-width": 0.8,
+						}}
+					/>
+				</GeoJSONSource>
+
+				{condition?.kind === "raster" && (
+					<RasterSource
+						key={condition.id}
+						id={`condition-${condition.id}`}
+						tiles={[condition.tiles]}
+						tileSize={256}
+						maxzoom={condition.maxzoom}
+						attribution={condition.source}
+					>
+						<Layer
+							id={`condition-${condition.id}-raster`}
+							type="raster"
+							beforeId="fire-hotspot-circles"
+							paint={{ "raster-opacity": condition.opacity }}
+						/>
+					</RasterSource>
+				)}
+
+				{condition?.kind === "grid" && (
+					<GeoJSONSource id="condition-grid" data={grid}>
+						<Layer
+							id="condition-grid-cells"
+							type="fill"
+							beforeId="fire-hotspot-circles"
+							filter={["==", ["get", "kind"], "cell"]}
+							paint={{
+								"fill-color": ["get", "color"],
+								"fill-opacity": 0.38,
+								"fill-outline-color": "#ffffff22",
+							}}
+						/>
+						<Layer
+							id="condition-grid-arrows"
+							beforeId="aircraft-icons"
+							type="line"
+							filter={["==", ["get", "kind"], "arrow"]}
+							layout={{ "line-cap": "round", "line-join": "round" }}
+							paint={{ "line-color": "#0f172a", "line-width": 2.5 }}
+						/>
+						<Layer
+							id="condition-grid-labels"
+							beforeId="aircraft-icons"
+							type="symbol"
+							filter={["==", ["get", "kind"], "label"]}
+							layout={{
+								"text-field": ["get", "label"],
+								"text-font": ["Noto Sans Regular"],
+								"text-size": 12,
+								"text-allow-overlap": true,
+							}}
+							paint={{
+								"text-color": "#0f172a",
+								"text-halo-color": "#ffffffcc",
+								"text-halo-width": 1.5,
+							}}
+						/>
+					</GeoJSONSource>
+				)}
+
+				{/* Planes stay mounted (empty when off) so they always draw on top. */}
+				<GeoJSONSource id="aircraft" data={aircraft}>
+					<Layer
+						id="aircraft-icons"
+						type="symbol"
+						layout={{
+							visibility: showPlanes ? "visible" : "none",
+							"icon-image": "plane",
+							"icon-size": ["interpolate", ["linear"], ["zoom"], 4, 0.3, 10, 0.55],
+							"icon-rotate": ["get", "track"],
+							"icon-rotation-alignment": "map",
+							"icon-allow-overlap": true,
+							"icon-ignore-placement": true,
+							"text-field": ["step", ["zoom"], "", 8, ["get", "callsign"]],
+							"text-font": ["Noto Sans Regular"],
+							"text-size": 11,
+							"text-offset": [0, 1.4],
+							"text-anchor": "top",
+							"text-optional": true,
+						}}
+						paint={{
+							"text-color": "#0f172a",
+							"text-halo-color": "#ffffffdd",
+							"text-halo-width": 1.2,
 						}}
 					/>
 				</GeoJSONSource>
@@ -229,7 +357,7 @@ export default function HomeScreen() {
 				<Text style={{ color: "#cbd5e1", marginTop: 4 }}>
 					{loading
 						? "Loading satellite detections..."
-						: `${fires.features.length.toLocaleString()} hotspots found`}
+						: `${fires.features.length.toLocaleString()} hotspots found${showFires ? "" : " (hidden)"}`}
 				</Text>
 
 				<View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
@@ -274,13 +402,35 @@ export default function HomeScreen() {
 				)}
 			</View>
 
+			{!selectedProperties && !helperExpanded && (
+				<MapLegend
+					bottom={bottomOffset}
+					condition={condition}
+					conditionLoading={gridLoading}
+					conditionError={gridError}
+					planeCount={showPlanes ? aircraft.features.length : null}
+					planeError={aircraftError}
+				/>
+			)}
+
+			<MapHelper
+				bottom={bottomOffset}
+				showPlanes={showPlanes}
+				showFires={showFires}
+				condition={conditionId}
+				onTogglePlanes={() => setShowPlanes((v) => !v)}
+				onToggleFires={() => setShowFires((v) => !v)}
+				onSelectCondition={setConditionId}
+				onExpandedChange={setHelperExpanded}
+			/>
+
 			{selectedProperties && (
 				<View
 					style={{
 						position: "absolute",
-						bottom: 24,
+						bottom: bottomOffset,
 						left: 16,
-						right: 16,
+						right: 76,
 						backgroundColor: "#101820f5",
 						borderRadius: 14,
 						padding: 16,
@@ -305,8 +455,8 @@ export default function HomeScreen() {
 						</Text>
 
 						<Text style={{ color: "#94a3b8", marginTop: 8 }}>
-							To enable tap-to-select, wire the GeoJSON source's onPress event
-							to setSelected using the pressed feature's properties.
+							To enable tap-to-select, wire the GeoJSON source&apos;s onPress event
+							to setSelected using the pressed feature&apos;s properties.
 						</Text>
 
 						<Pressable
