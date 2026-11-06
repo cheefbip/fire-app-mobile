@@ -32,14 +32,16 @@ export function MapLegend({
             <Text style={[styles.title, { color: map.text }]}>{condition.label}</Text>
             {conditionLoading && <ActivityIndicator size="small" color={map.spinner} />}
           </View>
-          <View style={styles.swatches}>
-            {condition.legend.map((item) => (
-              <View key={item.label} style={styles.swatchItem}>
-                <View style={[styles.swatch, { backgroundColor: item.color }]} />
-                <Text style={[styles.swatchLabel, { color: map.textBody }]}>{item.label}</Text>
-              </View>
-            ))}
-          </View>
+          {!!condition.legend?.length && (
+            <View style={styles.swatches}>
+              {condition.legend.map((item) => (
+                <View key={item.label} style={styles.swatchItem}>
+                  <View style={[styles.swatch, { backgroundColor: item.color }]} />
+                  <Text style={[styles.swatchLabel, { color: map.textBody }]}>{item.label}</Text>
+                </View>
+              ))}
+            </View>
+          )}
           <Text style={[styles.source, { color: map.textSubtle }]}>{condition.source}</Text>
           {!!conditionError && <Text style={[styles.error, { color: map.error }]}>{conditionError}</Text>}
         </View>
