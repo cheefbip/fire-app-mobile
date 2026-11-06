@@ -11,14 +11,12 @@ import { useTheme } from '@/hooks/use-theme';
 type Props = {
   title: string;
   icon: SymbolViewProps['name'];
-  description: string;
-  /** Short list of what this tab will do once it's built. */
-  planned: string[];
+  /** The tab's content, shown below the header. */
   children?: ReactNode;
 };
 
-/** Temporary screen shown for tabs that aren't built yet. */
-export function TabPlaceholder({ title, icon, description, planned, children }: Props) {
+/** Basic tab layout: icon and title, with the tab's content underneath. */
+export function TabScreen({ title, icon, children }: Props) {
   const insets = useSafeAreaInsets();
   const theme = useTheme();
 
@@ -37,25 +35,9 @@ export function TabPlaceholder({ title, icon, description, planned, children }: 
           <SymbolView name={icon} size={30} tintColor={theme.text} />
         </ThemedView>
         <ThemedText type="subtitle">{title}</ThemedText>
-        <ThemedView type="backgroundSelected" style={styles.comingSoon}>
-          <ThemedText type="smallBold">Coming soon</ThemedText>
-        </ThemedView>
-        <ThemedText themeColor="textSecondary" style={styles.center}>
-          {description}
-        </ThemedText>
       </View>
 
       {children}
-
-      <ThemedView type="backgroundElement" style={styles.card}>
-        <ThemedText type="smallBold">Planned</ThemedText>
-        {planned.map((item) => (
-          <ThemedText key={item} type="small" themeColor="textSecondary">
-            {'•  '}
-            {item}
-          </ThemedText>
-        ))}
-      </ThemedView>
     </ScrollView>
   );
 }
@@ -78,18 +60,5 @@ const styles = StyleSheet.create({
     borderRadius: 32,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  comingSoon: {
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.one,
-    borderRadius: Spacing.three,
-  },
-  center: {
-    textAlign: 'center',
-  },
-  card: {
-    padding: Spacing.three,
-    borderRadius: Spacing.three,
-    gap: Spacing.two,
   },
 });

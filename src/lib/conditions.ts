@@ -212,6 +212,11 @@ const MAX_POINTS_PER_REQUEST = 100;
 const MAX_CACHED_SAMPLES = 4000;
 /** How many nearby samples blend into a hex's color. */
 const BLEND_NEIGHBORS = 4;
+/**
+ * Shades between each pair of legend colors. Blended colors snap to these, so
+ * a small pan leaves most hexes' fills unchanged and they skip re-rendering.
+ */
+const COLOR_STEPS = 8;
 /** A sample can color hexes up to this many sample spacings away (at the level it was used at). */
 const SAMPLE_REACH = 1;
 
@@ -229,7 +234,8 @@ function colorFor(value: number, stops: Stop[]) {
 		const [v1, c1] = stops[i];
 		if (value <= v1) {
 			const [v0, c0] = stops[i - 1];
-			const t = v1 === v0 ? 1 : (value - v0) / (v1 - v0);
+			const exact = v1 === v0 ? 1 : (value - v0) / (v1 - v0);
+			const t = Math.round(exact * COLOR_STEPS) / COLOR_STEPS;
 			const a = hexToRgb(c0);
 			const b = hexToRgb(c1);
 			const mix = a.map((x, k) => Math.round(x + (b[k] - x) * t));

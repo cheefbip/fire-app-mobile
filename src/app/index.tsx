@@ -24,10 +24,9 @@ import { MapLegend } from "@/components/map/map-legend";
 import { BottomTabInset } from "@/constants/theme";
 import { useMapTheme } from "@/hooks/use-map-theme";
 import { useAircraft } from "@/lib/aircraft";
-import { HexOverlay } from "@/components/map/hex-overlay";
+import { HexLayer, type HexStatus } from "@/components/map/hex-overlay";
 import {
 	getCondition,
-	useConditionSamples,
 	type ConditionId,
 	type MapView,
 } from "@/lib/conditions";
@@ -554,11 +553,12 @@ export default function HomeScreen() {
 
 	const condition = getCondition(conditionId);
 	const { aircraft, error: aircraftError } = useAircraft(showPlanes, bounds);
-	const {
-		samples: gridSamples,
-		loading: gridLoading,
-		error: gridError,
-	} = useConditionSamples(condition, bounds, zoom);
+	// Hex data lives in <HexLayer> so new data re-renders only the overlay;
+	// this screen just tracks loading/error for the legend card.
+	const [gridStatus, setGridStatus] = useState<HexStatus>({
+		loading: false,
+		error: "",
+	});
 	// Live map position for the hex overlay. Kept out of state so map movement
 	// re-renders only the overlay, not this whole screen.
 	const [viewStore] = useState(() => createMapViewStore(INITIAL_VIEW));
@@ -796,16 +796,17 @@ export default function HomeScreen() {
 			</Map>
 
 			{/* Fixed on-screen honeycomb; the map moves underneath it. */}
-			{condition?.kind === "grid" && (
-				<HexOverlay
-					condition={condition}
-					samples={gridSamples}
-					view={viewStore}
-					fillOpacity={map.gridOpacity}
-					borderColor={map.border}
-					labelColor={map.mapLabel}
-				/>
-			)}
+			{/* Stays mounted for every layer so downloaded data survives switching. */}
+			<HexLayer
+				condition={condition}
+				bounds={bounds}
+				zoom={zoom}
+				onStatusChange={setGridStatus}
+				view={viewStore}
+				fillOpacity={map.gridOpacity}
+				borderColor={map.border}
+				labelColor={map.mapLabel}
+			/>
 
 			<View
 				style={{
@@ -882,8 +883,8 @@ export default function HomeScreen() {
 				<MapLegend
 					bottom={bottomOffset}
 					condition={condition}
-					conditionLoading={gridLoading}
-					conditionError={gridError}
+					conditionLoading={gridStatus.loading}
+					conditionError={gridStatus.error}
 					planeCount={showPlanes ? aircraft.features.length : null}
 					planeError={aircraftError}
 				/>
