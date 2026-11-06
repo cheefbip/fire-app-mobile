@@ -24,12 +24,17 @@ import { MapLegend } from "@/components/map/map-legend";
 import { BottomTabInset } from "@/constants/theme";
 import { useMapTheme } from "@/hooks/use-map-theme";
 import { useAircraft } from "@/lib/aircraft";
+import { HexOverlay } from "@/components/map/hex-overlay";
 import {
 	getCondition,
-	useConditionGrid,
+	useConditionSamples,
 	type ConditionId,
+	type MapView,
 } from "@/lib/conditions";
 import { DEFAULT_BOUNDS, type Bounds } from "@/lib/geo";
+import { createMapViewStore } from "@/lib/map-view-store";
+
+const INITIAL_VIEW: MapView = { center: [-98.5795, 39.8283], zoom: 3 };
 
 const MAPTILER_API_KEY = process.env.EXPO_PUBLIC_MAPTILER_API_KEY;
 
@@ -550,10 +555,13 @@ export default function HomeScreen() {
 	const condition = getCondition(conditionId);
 	const { aircraft, error: aircraftError } = useAircraft(showPlanes, bounds);
 	const {
-		grid,
+		samples: gridSamples,
 		loading: gridLoading,
 		error: gridError,
-	} = useConditionGrid(condition, bounds, zoom);
+	} = useConditionSamples(condition, bounds, zoom);
+	// Live map position for the hex overlay. Kept out of state so map movement
+	// re-renders only the overlay, not this whole screen.
+	const [viewStore] = useState(() => createMapViewStore(INITIAL_VIEW));
 
 	// Keeps floating UI just above the bottom tab bar.
 	const bottomOffset = insets.bottom + BottomTabInset + 12;
@@ -609,10 +617,17 @@ export default function HomeScreen() {
 				style={{ flex: 1 }}
 				mapStyle={map.basemap}
 				onPress={() => setSelected(null)}
+				onRegionIsChanging={(event) => {
+					const { center, zoom } = event.nativeEvent;
+					viewStore.set({ center, zoom });
+				}}
 				onRegionDidChange={(event) => {
-					setBounds(event.nativeEvent.bounds);
-					// Rounded so float noise on a pure pan doesn't reshuffle the hexes.
-					setZoom(Math.round(event.nativeEvent.zoom * 1000) / 1000);
+					const { bounds, center, zoom } = event.nativeEvent;
+					viewStore.set({ center, zoom }, true);
+					// Bounds and zoom in state drive fetching, which waits for the map to settle.
+					setBounds(bounds);
+					// Rounded so float noise on a pure pan doesn't change the sample level.
+					setZoom(Math.round(zoom * 1000) / 1000);
 				}}
 				dragPan={true}
 				touchZoom={true}
@@ -669,7 +684,7 @@ export default function HomeScreen() {
 					/>
 				</GeoJSONSource>
 
-				<Camera initialViewState={{ center: [-98.5795, 39.8283], zoom: 3 }} />
+				<Camera initialViewState={INITIAL_VIEW} />
 
 				<Images images={{ plane: require("@/assets/images/map/plane.png") }} />
 
@@ -743,47 +758,6 @@ export default function HomeScreen() {
 					</RasterSource>
 				)}
 
-				{condition?.kind === "grid" && (
-					<GeoJSONSource id="condition-grid" data={grid}>
-						<Layer
-							id="condition-grid-cells"
-							type="fill"
-							beforeId="wildfire-perimeter-fill"
-							filter={["==", ["get", "kind"], "cell"]}
-							paint={{
-								"fill-color": ["get", "color"],
-								"fill-opacity": map.gridOpacity,
-								"fill-outline-color": map.border,
-							}}
-						/>
-						<Layer
-							id="condition-grid-arrows"
-							beforeId="aircraft-icons"
-							type="line"
-							filter={["==", ["get", "kind"], "arrow"]}
-							layout={{ "line-cap": "round", "line-join": "round" }}
-							paint={{ "line-color": map.mapLabel, "line-width": 2.5 }}
-						/>
-						<Layer
-							id="condition-grid-labels"
-							beforeId="aircraft-icons"
-							type="symbol"
-							filter={["==", ["get", "kind"], "label"]}
-							layout={{
-								"text-field": ["get", "label"],
-								"text-font": ["Noto Sans Regular"],
-								"text-size": 12,
-								"text-allow-overlap": true,
-							}}
-							paint={{
-								"text-color": map.mapLabel,
-								"text-halo-color": map.mapLabelHalo,
-								"text-halo-width": 1.5,
-							}}
-						/>
-					</GeoJSONSource>
-				)}
-
 				{/* Planes stay mounted (empty when off) so they always draw on top. */}
 				<GeoJSONSource id="aircraft" data={aircraft}>
 					<Layer
@@ -820,6 +794,18 @@ export default function HomeScreen() {
 					/>
 				</GeoJSONSource>
 			</Map>
+
+			{/* Fixed on-screen honeycomb; the map moves underneath it. */}
+			{condition?.kind === "grid" && (
+				<HexOverlay
+					condition={condition}
+					samples={gridSamples}
+					view={viewStore}
+					fillOpacity={map.gridOpacity}
+					borderColor={map.border}
+					labelColor={map.mapLabel}
+				/>
+			)}
 
 			<View
 				style={{

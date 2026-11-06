@@ -1,5 +1,5 @@
 import type { SymbolViewProps } from 'expo-symbols';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 
 import { boundsKey, clampBounds, type Bounds } from '@/lib/geo';
@@ -194,13 +194,15 @@ export function getCondition(id: ConditionId | null) {
 //   everything already fetched, and zooming out over an area you've already
 //   seen needs no requests at all.
 //
-// - Hexes: what's drawn. Always HEX_WIDTH_PX wide on screen and rebuilt from
-//   the cached samples as soon as the view changes, without waiting on the
-//   network. Colors blend the nearest samples; numbers and wind arrows show
-//   the single nearest sample, and update once closer samples arrive.
+// - Hexes: what's drawn. A honeycomb fixed to the screen (the map is always
+//   north-up and flat, so screen points map straight onto the map). As the
+//   map moves underneath, each hex is re-shaded from the cached samples
+//   without waiting on the network. Colors blend the nearest samples; numbers
+//   and wind arrows show the single nearest sample, never interpolated, and
+//   update once closer samples arrive. Drawing lives in components/map/hex-overlay.
 
 /** On-screen width of a hex, in points (MapLibre's logical pixels). */
-const HEX_WIDTH_PX = 48;
+export const HEX_WIDTH_PX = 48;
 /** Sample spacing at a whole zoom level. Between levels it's ~90–180 px. */
 const SAMPLE_SPACING_PX = 128;
 /** ~10 km spacing. Open-Meteo's models aren't finer than that, so stop here. */
@@ -218,13 +220,6 @@ const SAMPLE_REACH = 1;
 
 const FORECAST_URL = 'https://api.open-meteo.com/v1/forecast';
 const AIR_QUALITY_URL = 'https://air-quality-api.open-meteo.com/v1/air-quality';
-
-export type GridCollection = GeoJSON.FeatureCollection<
-  GeoJSON.Geometry,
-  { kind: 'cell' | 'label' | 'arrow'; color: string; label: string }
->;
-
-export const EMPTY_GRID: GridCollection = { type: 'FeatureCollection', features: [] };
 
 function hexToRgb(hex: string) {
   const n = parseInt(hex.slice(1), 16);
@@ -287,7 +282,7 @@ type Sample = SamplePoint &
     fetchedAt: number;
   };
 
-type SampleCache = ReadonlyMap<string, Sample>;
+export type SampleCache = ReadonlyMap<string, Sample>;
 
 /**
  * Sample points covering the view at `level`, plus one ring outside it so
@@ -414,50 +409,69 @@ function claimLevel(cache: SampleCache, keys: string[], level: number): SampleCa
 
 // --- Hexes ------------------------------------------------------------------
 
-type HexCenter = { lon: number; lat: number; radiusLat: number };
+/** Where the map is looking. North is always up (rotate and tilt are off). */
+export type MapView = { center: [number, number]; zoom: number };
 
-/** Arrow pointing the way the wind is blowing (Open-Meteo gives the "from" direction). */
-function windArrow(cell: HexCenter, fromDeg: number): GeoJSON.MultiLineString {
-  const bearing = ((fromDeg + 180) % 360) * DEG;
-  const len = cell.radiusLat * 0.55;
-  const k = 1 / Math.cos(cell.lat * DEG); // keep arrows from stretching east-west
-  const point = (b: number, d: number, from: [number, number]): [number, number] => [
-    from[0] + Math.sin(b) * d * k,
-    from[1] + Math.cos(b) * d,
-  ];
-  const center: [number, number] = [cell.lon, cell.lat];
-  const tail = point(bearing + Math.PI, len, center);
-  const tip = point(bearing, len, center);
-  const head = len * 0.45;
-  return {
-    type: 'MultiLineString',
-    coordinates: [
-      [tail, tip],
-      [tip, point(bearing + Math.PI - 0.5, head, tip)],
-      [tip, point(bearing + Math.PI + 0.5, head, tip)],
-    ],
-  };
+/** Center of one hex in the fixed on-screen honeycomb, in screen points. */
+export type ScreenHex = { cx: number; cy: number };
+
+export type HexShade = {
+  /** Blended from the nearest samples. */
+  color: string;
+  /** The single nearest sample's value. Never interpolated. */
+  label: string;
+  /** The nearest sample's wind direction ("from", degrees), if it has one. */
+  direction: number | null;
+};
+
+/**
+ * Pointy-top honeycomb covering a width × height screen. It depends only on
+ * the screen size, so the hexes never move; only their contents change.
+ */
+export function screenHexes(width: number, height: number): ScreenHex[] {
+  const r = HEX_WIDTH_PX / SQRT3;
+  const rowStep = 1.5 * r;
+  const hexes: ScreenHex[] = [];
+  if (width <= 0 || height <= 0) return hexes;
+  for (let row = 0; row * rowStep <= height + r; row++) {
+    const offset = row % 2 === 1 ? HEX_WIDTH_PX / 2 : 0;
+    for (let col = 0; col * HEX_WIDTH_PX + offset <= width + HEX_WIDTH_PX / 2; col++) {
+      hexes.push({ cx: col * HEX_WIDTH_PX + offset, cy: row * rowStep });
+    }
+  }
+  return hexes;
 }
 
 type Neighbor = { sample: Sample; d2: number; reach2: number };
 
 /**
- * Pointy-top hexes HEX_WIDTH_PX wide at `zoom`, anchored at mercator (0, 0)
- * so panning reuses the same cells. Each hex is colored by blending the
- * nearest cached samples (inverse-distance weighted) and labeled with the
- * single nearest sample's value. Hexes with no sample in reach are left out
- * until data for them arrives.
+ * What each on-screen hex shows for the current map view: a color blended
+ * from the nearest cached samples (inverse-distance weighted), plus the
+ * single nearest sample's number and wind direction. A hex with no sample in
+ * reach gets null and is drawn empty until data for it arrives.
  */
-function buildGrid(
+export function shadeHexes(
   condition: GridCondition,
   cache: SampleCache | undefined,
-  bounds: Bounds,
-  zoom: number
-): GridCollection {
-  if (!cache?.size) return EMPTY_GRID;
-  const { x0, x1, y0, y1 } = viewRect(bounds);
+  view: MapView,
+  width: number,
+  height: number,
+  hexes: ScreenHex[]
+): (HexShade | null)[] {
+  if (!cache?.size || width <= 0 || height <= 0) return hexes.map(() => null);
 
-  // Only samples that can reach the view take part.
+  // Screen point -> mercator. Linear because the map never rotates or tilts.
+  const rpp = radiansPerPx(view.zoom);
+  const mx = view.center[0] * DEG;
+  const my = toMercY(view.center[1]);
+  const toX = (px: number) => mx + (px - width / 2) * rpp;
+  const toY = (py: number) => my - (py - height / 2) * rpp;
+  const x0 = toX(0);
+  const x1 = toX(width);
+  const y0 = toY(height);
+  const y1 = toY(0);
+
+  // Only samples that can reach the screen take part.
   const nearby: { sample: Sample; reach2: number }[] = [];
   for (const sample of cache.values()) {
     if (sample.value == null) continue;
@@ -466,102 +480,58 @@ function buildGrid(
     if (sample.y < y0 - reach || sample.y > y1 + reach) continue;
     nearby.push({ sample, reach2: reach * reach });
   }
-  if (!nearby.length) return EMPTY_GRID;
+  if (!nearby.length) return hexes.map(() => null);
 
-  const r = (HEX_WIDTH_PX / SQRT3) * radiansPerPx(zoom);
-  const colStep = SQRT3 * r;
-  const rowStep = 1.5 * r;
-  const features: GridCollection['features'] = [];
+  return hexes.map((hex) => {
+    const x = toX(hex.cx);
+    const y = toY(hex.cy);
+    if (Math.abs(x) > Math.PI || Math.abs(y) > MAX_MERC_Y) return null;
 
-  for (let row = Math.floor(y0 / rowStep) - 1; row <= Math.ceil(y1 / rowStep) + 1; row++) {
-    const cy = row * rowStep;
-    if (Math.abs(cy) > MAX_MERC_Y) continue;
-    const offset = Math.abs(row % 2) === 1 ? colStep / 2 : 0;
-    for (
-      let col = Math.floor((x0 - offset) / colStep) - 1;
-      col <= Math.ceil((x1 - offset) / colStep) + 1;
-      col++
-    ) {
-      const cx = col * colStep + offset;
-      if (cx < x0 - r || cx > x1 + r || cy < y0 - r || cy > y1 + r) continue;
-      if (Math.abs(cx) > Math.PI) continue;
-
-      // The few nearest samples, closest first.
-      const best: Neighbor[] = [];
-      for (const { sample, reach2 } of nearby) {
-        const dx = sample.x - cx;
-        const dy = sample.y - cy;
-        const d2 = dx * dx + dy * dy;
-        if (best.length === BLEND_NEIGHBORS && d2 >= best[best.length - 1].d2) continue;
-        let at = best.length;
-        while (at > 0 && best[at - 1].d2 > d2) at--;
-        best.splice(at, 0, { sample, d2, reach2 });
-        if (best.length > BLEND_NEIGHBORS) best.pop();
-      }
-      if (!best.some((n) => n.d2 <= n.reach2)) continue;
-
-      // Blend for color; nearest for the number and arrow.
-      const nearest = best[0].sample;
-      let blended = nearest.value!;
-      if (best[0].d2 > 1e-18) {
-        let sum = 0;
-        let weights = 0;
-        for (const n of best) {
-          const w = 1 / n.d2;
-          sum += n.sample.value! * w;
-          weights += w;
-        }
-        blended = sum / weights;
-      }
-      const color = colorFor(blended, condition.stops);
-      const label = formatValue(condition.id, nearest.value!);
-
-      const ring: [number, number][] = [];
-      for (let k = 0; k < 6; k++) {
-        const angle = (Math.PI / 3) * k + Math.PI / 6; // pointy top
-        ring.push([(cx + r * Math.cos(angle)) / DEG, fromMercY(cy + r * Math.sin(angle))]);
-      }
-      ring.push(ring[0]);
-      const lat = fromMercY(cy);
-      const center: HexCenter = { lon: cx / DEG, lat, radiusLat: fromMercY(cy + r) - lat };
-
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Polygon', coordinates: [ring] },
-        properties: { kind: 'cell', color, label },
-      });
-
-      const dir = nearest.direction;
-      if (dir != null) {
-        features.push({
-          type: 'Feature',
-          geometry: windArrow(center, dir),
-          properties: { kind: 'arrow', color, label },
-        });
-      }
-
-      // Wind labels sit just below the arrow so they don't overlap it.
-      const labelLat = dir != null ? lat - center.radiusLat * 0.6 : lat;
-      features.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [center.lon, labelLat] },
-        properties: { kind: 'label', color, label },
-      });
+    // The few nearest samples, closest first.
+    const best: Neighbor[] = [];
+    for (const { sample, reach2 } of nearby) {
+      const dx = sample.x - x;
+      const dy = sample.y - y;
+      const d2 = dx * dx + dy * dy;
+      if (best.length === BLEND_NEIGHBORS && d2 >= best[best.length - 1].d2) continue;
+      let at = best.length;
+      while (at > 0 && best[at - 1].d2 > d2) at--;
+      best.splice(at, 0, { sample, d2, reach2 });
+      if (best.length > BLEND_NEIGHBORS) best.pop();
     }
-  }
+    if (!best.some((n) => n.d2 <= n.reach2)) return null;
 
-  return { type: 'FeatureCollection', features };
+    // Blend for color; nearest for the number and arrow.
+    const nearest = best[0].sample;
+    let blended = nearest.value!;
+    if (best[0].d2 > 1e-18) {
+      let sum = 0;
+      let weights = 0;
+      for (const n of best) {
+        const w = 1 / n.d2;
+        sum += n.sample.value! * w;
+        weights += w;
+      }
+      blended = sum / weights;
+    }
+
+    return {
+      color: colorFor(blended, condition.stops),
+      label: formatValue(condition.id, nearest.value!),
+      direction: nearest.direction,
+    };
+  });
 }
 
 // --- Hook -------------------------------------------------------------------
 
 /**
- * Hex grid for the active condition. Hexes are redrawn from cached samples
- * right away whenever the view changes; missing samples are fetched after a
- * short pause, and stale ones (older than POLL_MS) are refreshed while the
- * app is open. Samples are kept per condition, so switching back is instant.
+ * Cached samples for the active condition, for the hex overlay to shade from.
+ * Missing samples for the view are fetched after a short pause once the map
+ * settles, and stale ones (older than POLL_MS) are refreshed while the app is
+ * open. Samples are kept per condition, so switching back is instant.
  */
-export function useConditionGrid(condition: Condition | null, bounds: Bounds, zoom: number) {
+export function useConditionSamples(condition: Condition | null, bounds: Bounds, zoom: number) {
   const [caches, setCaches] = useState<Partial<Record<ConditionId, SampleCache>>>({});
   const [pending, setPending] = useState<Partial<Record<ConditionId, number>>>({});
   const [error, setError] = useState<{ id: ConditionId; message: string } | null>(null);
@@ -653,14 +623,8 @@ export function useConditionGrid(condition: Condition | null, bounds: Bounds, zo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, key, level]);
 
-  const cache = id ? caches[id] : undefined;
-  const grid = useMemo(
-    () => (gridCondition ? buildGrid(gridCondition, cache, bounds, zoom) : EMPTY_GRID),
-    [gridCondition, cache, bounds, zoom]
-  );
-
   return {
-    grid,
+    samples: id ? caches[id] : undefined,
     loading: id != null && (pending[id] ?? 0) > 0,
     error: id && error?.id === id ? error.message : '',
   };
