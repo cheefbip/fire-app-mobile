@@ -1,12 +1,14 @@
 import { SymbolView, type SymbolViewProps } from 'expo-symbols';
 import { useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { useMapTheme } from '@/hooks/use-map-theme';
 import { CONDITIONS, type ConditionId } from '@/lib/conditions';
 
 type Props = {
   bottom: number;
+  locating: boolean;
+  onLocate: () => void;
   showPlanes: boolean;
   showFires: boolean;
   condition: ConditionId | null;
@@ -19,10 +21,12 @@ type Props = {
 
 /**
  * Floating map controls, bottom-right just above the tab bar:
- *  1. Planes on/off   2. Fires on/off   3. Area conditions (expands a menu)
+ * Location, planes, fires, and the area conditions menu.
  */
 export function MapHelper({
   bottom,
+  locating,
+  onLocate,
   showPlanes,
   showFires,
   condition,
@@ -93,6 +97,13 @@ export function MapHelper({
 
       <View style={styles.stack}>
         <HelperButton
+          label={locating ? 'Finding your location' : 'Center map on your location'}
+          icon={{ ios: 'location.fill', android: 'my_location', web: 'my_location' }}
+          active={false}
+          loading={locating}
+          onPress={onLocate}
+        />
+        <HelperButton
           label="Toggle aircraft"
           icon={{ ios: 'airplane', android: 'flight', web: 'flight' }}
           active={showPlanes}
@@ -119,27 +130,32 @@ function HelperButton({
   label,
   icon,
   active,
+  loading = false,
   onPress,
 }: {
   label: string;
   icon: SymbolViewProps['name'];
   active: boolean;
+  loading?: boolean;
   onPress: () => void;
 }) {
   const map = useMapTheme();
   return (
     <Pressable
       onPress={onPress}
+      disabled={loading}
       accessibilityLabel={label}
       accessibilityRole="button"
-      accessibilityState={{ selected: active }}
+      accessibilityState={{ selected: active, disabled: loading, busy: loading }}
       hitSlop={4}
       style={({ pressed }) => [
         styles.button,
         { backgroundColor: active ? map.active : map.panel, borderColor: map.border },
         pressed && styles.pressed,
       ]}>
-      <SymbolView name={icon} size={22} tintColor={active ? map.onActive : map.text} />
+      {loading
+        ? <ActivityIndicator color={map.text} />
+        : <SymbolView name={icon} size={22} tintColor={active ? map.onActive : map.text} />}
     </Pressable>
   );
 }
