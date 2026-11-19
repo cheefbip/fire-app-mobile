@@ -8,11 +8,15 @@ import {
 	Layer,
 	Map,
 	RasterSource,
+	type CameraRef,
 } from "@maplibre/maplibre-react-native";
+import { useFocusEffect } from "expo-router";
 import { SymbolView, type SymbolViewProps } from "expo-symbols";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	ActivityIndicator,
+	Alert,
+	Linking,
 	Platform,
 	Pressable,
 	ScrollView,
@@ -25,6 +29,7 @@ import { HexLayer, type HexStatus } from "@/components/map/hex-overlay";
 import { MapHelper } from "@/components/map/map-helper";
 import { MapLegend } from "@/components/map/map-legend";
 import { BottomTabInset } from "@/constants/theme";
+import { useMapLocation } from "@/hooks/use-map-location";
 import { useMapTheme } from "@/hooks/use-map-theme";
 import { useAircraft } from "@/lib/aircraft";
 import { getCondition, type ConditionId, type MapView } from "@/lib/conditions";
@@ -692,6 +697,9 @@ function weatherSymbol(forecast: string): SymbolViewProps["name"] {
 export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const map = useMapTheme();
+  const camera = useRef<CameraRef>(null);
+  const centerWhenLocated = useRef(false);
+  const location = useMapLocation();
   const [hours, setHours] = useState(24);
   const [fires, setFires] = useState<FireCollection>(EMPTY_DATA);
   const [perimeters, setPerimeters] =
@@ -729,6 +737,58 @@ export default function HomeScreen() {
   // Live map position for the hex overlay. Kept out of state so map movement
   // re-renders only the overlay, not this whole screen.
   const [viewStore] = useState(() => createMapViewStore(INITIAL_VIEW));
+
+  const centerOnLocation = useCallback(() => {
+    if (!location.position) return;
+    const { longitude, latitude } = location.position.coords;
+    camera.current?.easeTo({
+      center: [longitude, latitude],
+      zoom: Math.max(viewStore.get().zoom, 12),
+      duration: 750,
+    });
+  }, [location.position, viewStore]);
+
+  useEffect(() => {
+    if (location.error) centerWhenLocated.current = false;
+    if (location.position && centerWhenLocated.current) {
+      centerWhenLocated.current = false;
+      centerOnLocation();
+    }
+  }, [location.position, location.error, centerOnLocation]);
+
+  useFocusEffect(useCallback(() => () => {
+    centerWhenLocated.current = false;
+  }, []));
+
+  const locate = () => {
+    if (location.position) {
+      centerOnLocation();
+      return;
+    }
+    if (location.error) {
+      Alert.alert("Your location", location.error.message, [
+        { text: "Cancel", style: "cancel" },
+        location.error.openSettings
+          ? {
+              text: "Open Settings",
+              onPress: () => {
+                centerWhenLocated.current = true;
+                void Linking.openSettings().catch(() => {
+                  centerWhenLocated.current = false;
+                  Alert.alert("Location access", "Open your device’s Settings and allow location access for Ignis.");
+                });
+              },
+            }
+          : {
+              text: "Try Again",
+              onPress: () => {
+                centerWhenLocated.current = true;
+                location.retry();
+              },
+            },
+      ]);
+    }
+  };
 
   // Keeps floating UI just above the bottom tab bar. Android's tab bar sits
   // below the map, so only a small margin is needed; on iOS and web the tab
@@ -907,7 +967,7 @@ export default function HomeScreen() {
           />
         </GeoJSONSource>
 
-        <Camera initialViewState={INITIAL_VIEW} />
+        <Camera ref={camera} initialViewState={INITIAL_VIEW} />
 
         <Images images={{ plane: require("@/assets/images/map/plane.png") }} />
 
@@ -1016,6 +1076,30 @@ export default function HomeScreen() {
             }}
           />
         </GeoJSONSource>
+        {location.position && (
+          <GeoJSONSource
+            id="current-location"
+            data={{
+              type: "Feature",
+              properties: {},
+              geometry: {
+                type: "Point",
+                coordinates: [location.position.coords.longitude, location.position.coords.latitude],
+              },
+            }}
+          >
+            <Layer
+              id="current-location-dot"
+              type="circle"
+              paint={{
+                "circle-radius": 7,
+                "circle-color": "#208AEF",
+                "circle-stroke-color": "#ffffff",
+                "circle-stroke-width": 3,
+              }}
+            />
+          </GeoJSONSource>
+        )}
       </Map>
 
       {/* Fixed on-screen honeycomb; the map moves underneath it. */}
@@ -1186,6 +1270,8 @@ export default function HomeScreen() {
 
       <MapHelper
         bottom={bottomOffset}
+        locating={location.loading}
+        onLocate={locate}
         showPlanes={showPlanes}
         showFires={showFires}
         condition={conditionId}

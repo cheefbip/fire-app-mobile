@@ -25,6 +25,25 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Test map location
+
+Rebuild the native app after installing dependencies (`npm run android`, or an
+iOS development build) because location support adds a native module and permissions.
+The map requests foreground location access, shows a blue dot, and provides a
+crosshair button above the other map controls to center on your location.
+
+- Allow location access, then check that the dot appears. In an emulator, set a
+  simulated GPS location first.
+- Pan away and tap the crosshair: the map should animate back to your location,
+  zooming in to at least level 12. Further panning should remain unrestricted.
+- Change the device's location and check that the dot moves without recentering.
+- Deny permission or disable location services, then tap the crosshair to see
+  recovery instructions. Restore access and retry (or return from Settings).
+- Switch tabs or background the app: location watching stops and resumes when
+  the map is active again. No background location permission is requested.
+
+Run the location lifecycle checks with `node --test scripts/test-map-location.cjs`.
+
 ## Get a fresh project
 
 When you're ready, run:
