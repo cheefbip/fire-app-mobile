@@ -1,5 +1,7 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import bbox from "@turf/bbox";
 import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
+import * as Notifications from "expo-notifications";
 
 import {
 	Camera,
@@ -7,19 +9,38 @@ import {
 	Layer,
 	Map,
 } from "@maplibre/maplibre-react-native";
-import { useCallback, useEffect, useState } from "react";
+import type { ComponentRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	ActivityIndicator,
+	AppState,
+	FlatList,
+	Linking,
+	Modal,
+	Platform,
 	Pressable,
 	ScrollView,
 	Text,
+	TextInput,
+	useWindowDimensions,
 	View,
 } from "react-native";
 
 
-const MAPTILER_API_KEY = process.env.EXPO_PUBLIC_MAPTILER_API_KEY;
-
 const FIRMS_MAP_KEY = process.env.EXPO_PUBLIC_FIRMS_MAP_KEY;
+
+const MAX_HOTSPOT_HOURS = 168;
+const HOTSPOT_DETAIL_ZOOM = 10;
+const TIME_WINDOWS = [
+	{ hours: 24, label: "24 hours" },
+	{ hours: 72, label: "3 days" },
+	{ hours: 168, label: "7 days" },
+];
+
+const ACTIVE_PERIMETER_WHERE =
+	"attr_IncidentTypeCategory = 'WF' " +
+	"AND attr_ActiveFireCandidate = 1 " +
+	"AND attr_FireOutDateTime IS NULL";
 
 const FIRMS_SOURCES = [
 	"VIIRS_NOAA20_NRT",
@@ -45,6 +66,7 @@ type Hotspot = {
 	};
 	properties: {
 		id: number;
+		perimeterKeys?: string[];
 		detected: number | null;
 		satellite: string;
 		confidence: string;
@@ -90,12 +112,14 @@ const EMPTY_DATA: FireCollection = {
 	features: [],
 };
 
-async function fetchFirms(hours: number): Promise<FireCollection> {
+async function fetchFirms(
+	hours: number,
+	now = Date.now()
+): Promise<FireCollection> {
 	if (!FIRMS_MAP_KEY) {
 		throw new Error("Missing EXPO_PUBLIC_FIRMS_MAP_KEY in .env");
 	}
 
-	const now = Date.now();
 	const cutoff = now - hours * 60 * 60 * 1000;
 	const dayMs = 24 * 60 * 60 * 1000;
 	const firstDay = Math.floor(cutoff / dayMs) * dayMs;
@@ -334,13 +358,14 @@ async function fetchPerimeters(): Promise<PerimeterCollection> {
 	while (true) {
 		const params = new URLSearchParams({
 			f: "geojson",
-			where: "attr_IncidentTypeCategory = 'WF'",
+			where: ACTIVE_PERIMETER_WHERE,
 			outFields: [
 				"OBJECTID",
 				"poly_IncidentName",
 				"poly_IRWINID",
 				"poly_PolygonDateTime",
 				"attr_IncidentTypeCategory",
+				"attr_ActiveFireCandidate",
 				"attr_FireDiscoveryDateTime",
 				"attr_PercentContained",
 				"attr_ContainmentDateTime",
@@ -427,7 +452,8 @@ async function filterHotspotsToPerimeters(
 		const hotspot = hotspots.features[i];
 		const [longitude, latitude] = hotspot.geometry.coordinates;
 
-		const matches = indexed.some(({ perimeter, bounds }) => {
+		const matchingKeys: string[] = [];
+		for (const { perimeter, bounds } of indexed) {
 			const [west, south, east, north] = bounds;
 
 			if (
@@ -436,20 +462,40 @@ async function filterHotspotsToPerimeters(
 				latitude < south ||
 				latitude > north
 			) {
-				return false;
+				continue;
 			}
 
-			return booleanPointInPolygon(hotspot, perimeter);
-		});
+			if (booleanPointInPolygon(hotspot, perimeter)) {
+				matchingKeys.push(perimeterKey(perimeter));
+			}
+		}
 
-		if (matches) {
-			features.push(hotspot);
+		if (matchingKeys.length > 0) {
+			features.push({ ...hotspot, properties: {
+				...hotspot.properties, perimeterKeys: [...new Set(matchingKeys)],
+			} });
 		}
 	}
 
 	return {
 		type: "FeatureCollection",
 		features,
+	};
+}
+
+function filterHotspotsByTime(
+	hotspots: FireCollection,
+	hours: number,
+	now: number
+): FireCollection {
+	const cutoff = now - hours * 60 * 60 * 1000;
+
+	return {
+		type: "FeatureCollection",
+		features: hotspots.features.filter(({ properties }) => {
+			const detected = properties.detected;
+			return detected != null && detected >= cutoff && detected <= now;
+		}),
 	};
 }
 
@@ -529,11 +575,373 @@ function readableContainment(value: unknown): string {
 	return `${percent}% contained`;
 }
 
+type PerimeterLocatorCollection = {
+	type: "FeatureCollection";
+	features: {
+		type: "Feature";
+		geometry: { type: "Point"; coordinates: [number, number] };
+		properties: { perimeterKey: string; hotspotCount: number };
+	}[];
+};
+
+function perimeterKey(perimeter: FirePerimeter): string {
+	return String(perimeter.properties.OBJECTID ?? perimeter.id ??
+		perimeter.properties.poly_IRWINID ?? "");
+}
+
+function perimeterName(perimeter: FirePerimeter): string {
+	return String(perimeter.properties.poly_IncidentName || "Unnamed wildfire");
+}
+
+function hotspotCountLabel(count: number): string {
+	return `${count.toLocaleString()} ${count === 1 ? "hotspot" : "hotspots"}`;
+}
+
+function countHotspotsByPerimeter(hotspots: FireCollection): globalThis.Map<string, number> {
+	const counts = new globalThis.Map<string, number>();
+	for (const hotspot of hotspots.features) {
+		for (const key of new Set(hotspot.properties.perimeterKeys ?? [])) {
+			counts.set(key, (counts.get(key) ?? 0) + 1);
+		}
+	}
+	return counts;
+}
+
+function perimeterHotspotCount(perimeter: FirePerimeter): number {
+	const value = perimeter.properties.appHotspotCount;
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function withHotspotCounts(
+	perimeters: PerimeterCollection,
+	counts: globalThis.Map<string, number>
+): PerimeterCollection {
+	return { type: "FeatureCollection", features: perimeters.features.map((perimeter) => ({
+		...perimeter,
+		properties: { ...perimeter.properties, appHotspotCount: counts.get(perimeterKey(perimeter)) ?? 0 },
+	})) };
+}
+
+function findPerimeters(perimeters: PerimeterCollection, query: string): FirePerimeter[] {
+	const search = query.trim().toLowerCase();
+	return perimeters.features
+		.filter((perimeter) => perimeterName(perimeter).toLowerCase().includes(search))
+		.slice()
+		.sort((a, b) => perimeterHotspotCount(b) - perimeterHotspotCount(a) ||
+			perimeterName(a).localeCompare(perimeterName(b)) ||
+			perimeterKey(a).localeCompare(perimeterKey(b)));
+}
+
+function buildPerimeterLocators(perimeters: PerimeterCollection): PerimeterLocatorCollection {
+	const features: PerimeterLocatorCollection["features"] = [];
+	for (const perimeter of perimeters.features) {
+		const coordinate = perimeter.geometry.type === "Polygon"
+			? perimeter.geometry.coordinates[0]?.[0]
+			: perimeter.geometry.coordinates[0]?.[0]?.[0];
+		const key = perimeterKey(perimeter);
+		if (!coordinate || !key || !Number.isFinite(coordinate[0]) ||
+			!Number.isFinite(coordinate[1])) continue;
+		features.push({
+			type: "Feature",
+			geometry: { type: "Point", coordinates: [coordinate[0], coordinate[1]] },
+			properties: { perimeterKey: key, hotspotCount: perimeterHotspotCount(perimeter) },
+		});
+	}
+	return { type: "FeatureCollection", features };
+}
+
+function perimeterFocusBounds(perimeter: FirePerimeter): [number, number, number, number] | null {
+	const [west, south, east, north] = bbox(perimeter);
+	if (![west, south, east, north].every(Number.isFinite)) return null;
+	const longitudePadding = Math.max((0.01 - (east - west)) / 2, 0);
+	const latitudePadding = Math.max((0.01 - (north - south)) / 2, 0);
+	return [Math.max(-180, west - longitudePadding), Math.max(-85, south - latitudePadding),
+		Math.min(180, east + longitudePadding), Math.min(85, north + latitudePadding)];
+}
+
+const FOLLOW_STORAGE_KEY = "ignis.followed-fires.v1";
+const FOLLOW_CHANNEL_ID = "followed-fire-updates-v2";
+
+Notifications.setNotificationHandler({
+	handleNotification: async () => ({
+		shouldShowAlert: true,
+		shouldShowBanner: true,
+		shouldShowList: true,
+		shouldPlaySound: true,
+		shouldSetBadge: false,
+	}),
+});
+
+type FollowObservation = {
+	containment: number | null;
+	recordAt: number | null;
+	boundaryAt: number | null;
+	outAt: number | null;
+	seenHotspots: Record<string, number>;
+};
+type FollowedFire = {
+	id: string;
+	name: string;
+	followedAt: number;
+	checkedAt: number;
+	baseline: FollowObservation;
+};
+type FireSnapshot = { hotspots: FireCollection; perimeters: PerimeterCollection; asOf: number };
+
+function notificationFireId(perimeter: FirePerimeter): string {
+	const id = perimeter.properties.poly_IRWINID;
+	return typeof id === "string" ? id.replace(/[{}]/g, "").trim().toLowerCase() : "";
+}
+
+function containmentNumber(value: unknown): number | null {
+	if (value == null || String(value).trim() === "") return null;
+	const number = typeof value === "number" || typeof value === "string" ? Number(value) : NaN;
+	return Number.isFinite(number) && number >= 0 && number <= 100 ? number : null;
+}
+
+function observeFollowedFire(id: string, snapshot: FireSnapshot): FollowObservation | null {
+	const boundaries = snapshot.perimeters.features.filter((fire) => notificationFireId(fire) === id);
+	if (boundaries.length === 0) return null;
+	boundaries.sort((a, b) =>
+		(perimeterTimestamp(b.properties.attr_ModifiedOnDateTime_dt) ?? 0) -
+		(perimeterTimestamp(a.properties.attr_ModifiedOnDateTime_dt) ?? 0));
+	const properties = boundaries[0].properties;
+	const keys = new Set(boundaries.map(perimeterKey));
+	const seenHotspots: Record<string, number> = {};
+	for (const hotspot of snapshot.hotspots.features) {
+		const detected = hotspot.properties.detected;
+		if (detected == null || !Number.isFinite(detected) ||
+			!hotspot.properties.perimeterKeys?.some((key) => keys.has(key))) continue;
+		const key = `${hotspot.properties.satellite}|${detected}|${hotspot.geometry.coordinates.join(",")}`;
+		seenHotspots[key] = detected;
+	}
+	return {
+		containment: containmentNumber(properties.attr_PercentContained),
+		recordAt: perimeterTimestamp(properties.attr_ModifiedOnDateTime_dt),
+		boundaryAt: Math.max(...boundaries.map((fire) =>
+			perimeterTimestamp(fire.properties.poly_PolygonDateTime) ?? 0)) || null,
+		outAt: perimeterTimestamp(properties.attr_FireOutDateTime),
+		seenHotspots,
+	};
+}
+
+function followedFireUpdate(fire: FollowedFire, observation: FollowObservation, asOf: number) {
+	const old = fire.baseline;
+	const changes: string[] = [];
+	if (observation.containment != null && observation.containment !== old.containment) {
+		changes.push(`Reported containment: ${observation.containment}%.`);
+	}
+	if (observation.outAt != null && observation.outAt !== old.outAt) changes.push("A reported out date was added or changed.");
+	if (observation.boundaryAt != null && observation.boundaryAt !== old.boundaryAt) changes.push("The mapped boundary record changed.");
+	const newDetections = Object.entries(observation.seenHotspots).filter(([key]) =>
+		!Object.prototype.hasOwnProperty.call(old.seenHotspots, key));
+	if (newDetections.length > 0) {
+		const latest = Math.max(...newDetections.map(([, detected]) => detected));
+		changes.push(`${newDetections.length} newly received satellite detection${newDetections.length === 1 ? "" : "s"}. Latest observation: ${formatTime(latest)}.`);
+	}
+	if (changes.length === 0 && observation.recordAt != null && observation.recordAt > (old.recordAt ?? 0)) {
+		changes.push("The incident record was updated.");
+	}
+	const cutoff = asOf - MAX_HOTSPOT_HOURS * 3600000;
+	const seenHotspots = Object.fromEntries(Object.entries({ ...old.seenHotspots, ...observation.seenHotspots })
+		.filter(([, detected]) => detected >= cutoff));
+	return { changes, next: { ...fire, checkedAt: asOf, baseline: {
+		containment: observation.containment ?? old.containment,
+		recordAt: observation.recordAt ?? old.recordAt,
+		boundaryAt: observation.boundaryAt ?? old.boundaryAt,
+		outAt: observation.outAt ?? old.outAt,
+		seenHotspots,
+	} } };
+}
+
+function parseFollowedFires(raw: string | null): FollowedFire[] {
+	if (!raw) return [];
+	const data: unknown = JSON.parse(raw);
+	if (!data || typeof data !== "object" || !("version" in data) || data.version !== 1 ||
+		!("fires" in data) || !Array.isArray(data.fires)) throw new Error("Saved followed-fire data could not be read.");
+	const ids = new Set<string>();
+	for (const fire of data.fires) {
+		const baseline = fire?.baseline;
+		if (!fire || typeof fire.id !== "string" || !fire.id || ids.has(fire.id) ||
+			typeof fire.name !== "string" || !Number.isFinite(fire.followedAt) || !Number.isFinite(fire.checkedAt) ||
+			!baseline || ["containment", "recordAt", "boundaryAt", "outAt"].some((key) =>
+				baseline[key] !== null && (typeof baseline[key] !== "number" || !Number.isFinite(baseline[key]))) ||
+			!baseline.seenHotspots || typeof baseline.seenHotspots !== "object" || Array.isArray(baseline.seenHotspots) ||
+			Object.values(baseline.seenHotspots).some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+			throw new Error("Saved followed-fire data could not be read.");
+		}
+		ids.add(fire.id);
+	}
+	return data.fires as FollowedFire[];
+}
+
+async function notificationPermission(ask: boolean): Promise<boolean> {
+	if (Platform.OS === "web") throw new Error("Use the Android or iOS app for phone notifications.");
+	if (Platform.OS === "android") {
+		await Notifications.setNotificationChannelAsync(FOLLOW_CHANNEL_ID, {
+			name: "Followed fire updates", importance: Notifications.AndroidImportance.HIGH,
+			vibrationPattern: [0, 200, 150, 200],
+		});
+	}
+	let permission = await Notifications.getPermissionsAsync();
+	if (!permission.granted && permission.canAskAgain && ask) permission = await Notifications.requestPermissionsAsync();
+	return permission.granted || permission.ios?.status === Notifications.IosAuthorizationStatus.PROVISIONAL;
+}
+
+async function sendFollowNotification(title: string, body: string, fireId?: string): Promise<void> {
+	await Notifications.scheduleNotificationAsync({
+		content: {
+			title, body,
+			...(Platform.OS === "ios" ? { sound: "default" as const } : {}),
+			data: { kind: fireId ? "fire-update" : "test", fireId: fireId ?? "" },
+		},
+		trigger: { channelId: FOLLOW_CHANNEL_ID },
+	});
+}
+
+function useFollowedFireNotifications(snapshot: FireSnapshot) {
+	const [following, setFollowing] = useState<FollowedFire[]>([]);
+	const [ready, setReady] = useState(false);
+	const [busy, setBusy] = useState(false);
+	const [notice, setNotice] = useState("");
+	const [allowed, setAllowed] = useState<boolean | null>(null);
+	const followingRef = useRef<FollowedFire[]>([]);
+	const readyRef = useRef(false);
+	const mounted = useRef(true);
+	const latest = useRef(snapshot);
+	latest.current = snapshot;
+	const queue = useRef<Promise<void>>(Promise.resolve());
+	const enqueue = useCallback((job: () => Promise<void>) => {
+		const result = queue.current.then(job);
+		queue.current = result.catch(() => {});
+		return result;
+	}, []);
+	const commit = useCallback(async (fires: FollowedFire[]) => {
+		await AsyncStorage.setItem(FOLLOW_STORAGE_KEY, JSON.stringify({ version: 1, fires }));
+		followingRef.current = fires;
+		if (mounted.current) setFollowing(fires);
+	}, []);
+	useEffect(() => {
+		let cancelled = false;
+		mounted.current = true;
+		void enqueue(async () => {
+			const saved = parseFollowedFires(await AsyncStorage.getItem(FOLLOW_STORAGE_KEY));
+			if (cancelled) return;
+			followingRef.current = saved;
+			readyRef.current = true;
+			setFollowing(saved);
+			setReady(true);
+		}).catch(() => { if (!cancelled) setNotice("Could not load saved follows. Restart the app to retry; saved data was not changed."); });
+		return () => { cancelled = true; mounted.current = false; };
+	}, [enqueue]);
+	const runAction = useCallback((job: () => Promise<void>) => enqueue(async () => {
+		if (!readyRef.current) throw new Error("Followed fires are still loading.");
+		if (mounted.current) { setBusy(true); setNotice(""); }
+		try { await job(); }
+		finally { if (mounted.current) setBusy(false); }
+	}).catch((error: unknown) => {
+		if (mounted.current) setNotice(error instanceof Error ? error.message : "Unable to update notifications.");
+	}), [enqueue]);
+	const enable = useCallback(() => runAction(async () => {
+		const permission = await notificationPermission(true);
+		if (mounted.current) {
+			setAllowed(permission);
+			setNotice(permission ? "Phone notifications are enabled. Updates are checked while this map is open." :
+				"Phone notifications are blocked. Enable them in your phone's app settings.");
+		}
+	}), [runAction]);
+	const follow = useCallback((perimeter: FirePerimeter) => runAction(async () => {
+		const id = notificationFireId(perimeter);
+		if (!id) throw new Error("This record has no stable incident ID and cannot be followed yet.");
+		if (followingRef.current.some((fire) => fire.id === id)) return;
+		const current = latest.current;
+		const baseline = observeFollowedFire(id, current);
+		if (!baseline) throw new Error("Refresh the map before following this fire.");
+		await commit([...followingRef.current, {
+			id, name: perimeterName(perimeter), followedAt: Date.now(), checkedAt: current.asOf, baseline,
+		}]);
+		const permission = await notificationPermission(true);
+		if (mounted.current) {
+			setAllowed(permission);
+			setNotice(permission ? `Following ${perimeterName(perimeter)}. You'll be notified of changes found while the map is open.` :
+				`Following ${perimeterName(perimeter)}. Phone notifications are blocked; enable them in app settings.`);
+		}
+	}), [commit, runAction]);
+	const unfollow = useCallback((id: string) => runAction(async () => {
+		await commit(followingRef.current.filter((fire) => fire.id !== id));
+		if (mounted.current) setNotice("Fire unfollowed.");
+	}), [commit, runAction]);
+	const test = useCallback(() => runAction(async () => {
+		const permission = await notificationPermission(true);
+		if (mounted.current) setAllowed(permission);
+		if (!permission) throw new Error("Allow notifications in your phone's app settings, then try the test again.");
+		await sendFollowNotification("Ignis — test notification", "This is a test. Yo");
+		if (mounted.current) setNotice("Test notification requested. Check the phone's notification panel.");
+	}), [runAction]);
+	useEffect(() => {
+		if (!ready) return;
+		void enqueue(async () => {
+			if (!mounted.current || AppState.currentState !== "active" || followingRef.current.length === 0) return;
+			const permission = await notificationPermission(false);
+			if (mounted.current) setAllowed(permission);
+			const next = [...followingRef.current];
+			let changed = false;
+			for (let index = 0; index < next.length; index++) {
+				if (!mounted.current || AppState.currentState !== "active") break;
+				const fire = next[index];
+				if (snapshot.asOf <= fire.checkedAt) continue;
+				const observation = observeFollowedFire(fire.id, snapshot);
+				if (!observation) continue;
+				const update = followedFireUpdate(fire, observation, snapshot.asOf);
+				if (update.changes.length > 0 && permission) {
+					try {
+						await sendFollowNotification(`Ignis — ${fire.name}`, update.changes.join(" "), fire.id);
+					} catch {
+						if (mounted.current) setNotice(`Could not send the update for ${fire.name}. It will be retried on the next refresh.`);
+						continue;
+					}
+				}
+				next[index] = update.next;
+				changed = true;
+			}
+			if (changed) await commit(next);
+		}).catch(() => { if (mounted.current) setNotice("Could not save notification progress. A later refresh may repeat an update."); });
+	}, [snapshot, ready, enqueue, commit]);
+	return { following, ready, busy, notice, allowed, follow, unfollow, enable, test };
+}
+
 export default function HomeScreen() {
 	const [hours, setHours] = useState(24);
-	const [fires, setFires] = useState<FireCollection>(EMPTY_DATA);
-	const [perimeters, setPerimeters] =
-		useState<PerimeterCollection>(EMPTY_PERIMETERS);
+	const cameraRef = useRef<ComponentRef<typeof Camera>>(null);
+	const window = useWindowDimensions();
+	const [mapHeight, setMapHeight] = useState(window.height);
+	const [headerHeight, setHeaderHeight] = useState(230);
+	const detailsMaxHeight = Math.min(mapHeight * 0.4,
+		Math.max(120, mapHeight - headerHeight - 48 - 160));
+	const [showFireList, setShowFireList] = useState(false);
+	const [showFollowing, setShowFollowing] = useState(false);
+	const [notificationTarget, setNotificationTarget] = useState<string | null>(null);
+	const [fireSearch, setFireSearch] = useState("");
+	const [snapshot, setSnapshot] = useState(() => ({
+		hotspots: EMPTY_DATA,
+		perimeters: EMPTY_PERIMETERS,
+		asOf: Date.now(),
+	}));
+	const followed = useFollowedFireNotifications(snapshot);
+	const requestVersion = useRef(0);
+	const fires = useMemo(
+		() => filterHotspotsByTime(snapshot.hotspots, hours, snapshot.asOf),
+		[snapshot, hours]
+	);
+	const hotspotCounts = useMemo(() => countHotspotsByPerimeter(fires), [fires]);
+	const perimeters = useMemo(
+		() => withHotspotCounts(snapshot.perimeters, hotspotCounts),
+		[snapshot.perimeters, hotspotCounts]
+	);
+	const matchingPerimeterCount = perimeters.features.filter((p) => perimeterHotspotCount(p) > 0).length;
+	const perimeterLocators = useMemo(() => buildPerimeterLocators(perimeters), [perimeters]);
+	const fireList = useMemo(() => findPerimeters(perimeters, fireSearch), [perimeters, fireSearch]);
+	const timeRangeLabel = TIME_WINDOWS.find((window) => window.hours === hours)?.label ?? `${hours} hours`;
 	const [selected, setSelected] = useState<Hotspot | null>(null);
 	const [selectedPerimeter, setSelectedPerimeter] =
 		useState<FirePerimeter | null>(null);
@@ -541,57 +949,112 @@ export default function HomeScreen() {
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
 
-
 	const refresh = useCallback(async () => {
+		const version = ++requestVersion.current;
+		const asOf = Date.now();
 		setLoading(true);
 		setError("");
 
 		try {
+
 			const [hotspotData, perimeterData] = await Promise.all([
-				fetchFirms(hours),
+				fetchFirms(MAX_HOTSPOT_HOURS, asOf),
 				fetchPerimeters(),
 			]);
+			if (version !== requestVersion.current) return;
 
 			const filteredHotspots = await filterHotspotsToPerimeters(
 				hotspotData,
 				perimeterData
 			);
+			if (version !== requestVersion.current) return;
 
-			console.log("Wildfire matching:", {
-				hours,
+			console.log("Wildfire matching (last 7 days):", {
 				nasaHotspots: hotspotData.features.length,
-				perimeters: perimeterData.features.length,
+				activeCandidatePerimeters: perimeterData.features.length,
 				matchedHotspots: filteredHotspots.features.length,
 			});
 
-			setFires(filteredHotspots);
-			setPerimeters(perimeterData);
+			setSnapshot({ hotspots: filteredHotspots, perimeters: perimeterData, asOf });
 			setSelected(null);
 			setSelectedPerimeter(null);
 		} catch (e) {
+			if (version !== requestVersion.current) return;
 			setError(
 				e instanceof Error ? e.message : "Unable to load fire data"
 			);
 		} finally {
-			setLoading(false);
+			if (version === requestVersion.current) setLoading(false);
 		}
-	}, [hours]);
+	}, []);
 
 	useEffect(() => {
-		refresh();
-
-		const timer = setInterval(refresh, 5 * 60 * 1000);
-		return () => clearInterval(timer);
+		void refresh();
+		const timer = setInterval(() => {
+			if (AppState.currentState === "active") void refresh();
+		}, 5 * 60 * 1000);
+		const appStateSubscription = AppState.addEventListener("change", (state) => {
+			if (state === "active") void refresh();
+		});
+		return () => {
+			clearInterval(timer);
+			appStateSubscription.remove();
+			requestVersion.current += 1;
+		};
 	}, [refresh]);
 
+	const focusPerimeter = useCallback((perimeter: FirePerimeter) => {
+		setShowFireList(false);
+		setShowFollowing(false);
+		setSelected(null);
+		setShowTechnical(false);
+		setSelectedPerimeter(perimeter);
+		const bounds = perimeterFocusBounds(perimeter);
+		if (!bounds) return;
+		cameraRef.current?.fitBounds(bounds, {
+			padding: { top: 48 + headerHeight + 16, right: 32,
+				bottom: detailsMaxHeight + 40, left: 32 },
+			duration: 900,
+		});
+	}, [headerHeight, detailsMaxHeight]);
+
+	useEffect(() => {
+		let active = true;
+		const receive = (response: Notifications.NotificationResponse | null) => {
+			const data = response?.notification.request.content.data;
+			if (active && data?.kind === "fire-update" && typeof data.fireId === "string") {
+				setNotificationTarget(data.fireId);
+				void Notifications.clearLastNotificationResponseAsync().catch(() => {});
+			}
+		};
+		const subscription = Notifications.addNotificationResponseReceivedListener(receive);
+		void Notifications.getLastNotificationResponseAsync().then(receive).catch(() => {});
+		return () => { active = false; subscription.remove(); };
+	}, []);
+	useEffect(() => {
+		if (!notificationTarget || loading) return;
+		const fire = perimeters.features.find((feature) => notificationFireId(feature) === notificationTarget);
+		if (fire) focusPerimeter(fire);
+		else setShowFollowing(true);
+		setNotificationTarget(null);
+	}, [notificationTarget, loading, perimeters, focusPerimeter]);
+
 	const selectedProperties = selected?.properties;
+	const selectedFollowId = selectedPerimeter ? notificationFireId(selectedPerimeter) : "";
+	const selectedIsFollowed = followed.following.some((fire) => fire.id === selectedFollowId);
 
 	return (
-		<View style={{ flex: 1, backgroundColor: "#101820" }}>
+		<View
+			style={{ flex: 1, backgroundColor: "#101820" }}
+			onLayout={(event) => setMapHeight(event.nativeEvent.layout.height)}
+		>
 			<Map
 				style={{ flex: 1 }}
 				mapStyle="https://tiles.openfreemap.org/styles/liberty"
-				onPress={() => setSelected(null)}
+				onPress={() => {
+					setSelected(null);
+					setSelectedPerimeter(null);
+				}}
 				dragPan={true}
 				touchZoom={true}
 				doubleTapHoldZoom={false}
@@ -600,6 +1063,7 @@ export default function HomeScreen() {
 				<GeoJSONSource
 					id="wildfire-perimeters"
 					data={perimeters}
+					hitbox={{ top: 28, right: 28, bottom: 28, left: 28 }}
 					onPress={(event) => {
 						event.stopPropagation();
 
@@ -622,17 +1086,15 @@ export default function HomeScreen() {
 								String(pressedId)
 						);
 
-						setSelected(null);
-						setShowTechnical(false);
-						setSelectedPerimeter(perimeter ?? null);
+						if (perimeter) focusPerimeter(perimeter);
 					}}
 				>
 					<Layer
 						id="wildfire-perimeter-fill"
 						type="fill"
 						paint={{
-							"fill-color": "#ff6b35",
-							"fill-opacity": 0.2,
+							"fill-color": ["case", [">", ["get", "appHotspotCount"], 0], "#d946ef", "#ff6b35"],
+							"fill-opacity": ["case", [">", ["get", "appHotspotCount"], 0], 0.35, 0.2],
 						}}
 					/>
 
@@ -640,19 +1102,65 @@ export default function HomeScreen() {
 						id="wildfire-perimeter-outline"
 						type="line"
 						paint={{
-							"line-color": "#ff9500",
-							"line-width": 2,
+							"line-color": ["case", ["==", ["to-string", ["get", "OBJECTID"]],
+								selectedPerimeter ? perimeterKey(selectedPerimeter) : ""], "#fff176",
+								[">", ["get", "appHotspotCount"], 0], "#d946ef", "#ff9500"],
+							"line-width": ["case", ["==", ["to-string", ["get", "OBJECTID"]],
+								selectedPerimeter ? perimeterKey(selectedPerimeter) : ""], 4,
+								[">", ["get", "appHotspotCount"], 0], 3.5, 2.5],
 						}}
 					/>
 				</GeoJSONSource>
 
-				<Camera initialViewState={{ center: [-98.5795, 39.8283], zoom: 3 }} />
+				<Camera ref={cameraRef} initialViewState={{ center: [-98.5795, 39.8283], zoom: 3 }} />
 
+				{/* Locators make small fires visible at regional / national zoom levels. */}
+				<GeoJSONSource
+					id="wildfire-locators"
+					data={perimeterLocators}
+					hitbox={{ top: 28, right: 28, bottom: 28, left: 28 }}
+					onPress={(event) => {
+						event.stopPropagation();
+						const key = event.nativeEvent.features.find(
+							(feature) => feature.properties?.perimeterKey != null
+						)?.properties?.perimeterKey;
+						const perimeter = perimeters.features.find(
+							(feature) => perimeterKey(feature) === String(key)
+						);
+						if (perimeter) focusPerimeter(perimeter);
+					}}
+				>
+					<Layer
+						id="wildfire-locator-circles"
+						type="circle"
+						maxzoom={HOTSPOT_DETAIL_ZOOM}
+						filter={[">", ["get", "hotspotCount"], 0]}
+						paint={{
+							"circle-color": "#d946ef",
+							"circle-radius": 6,
+							"circle-stroke-color": "#ffffff",
+							"circle-stroke-width": 1.5,
+						}}
+					/>
+					{/* Keep a locator at close zoom if no matching detections can replace it. */}
+					<Layer
+						id="wildfire-locators-without-hotspots"
+						type="circle"
+						filter={["==", ["get", "hotspotCount"], 0]}
+						paint={{
+							"circle-color": "#38bdf8",
+							"circle-radius": 6,
+							"circle-stroke-color": "#ffffff",
+							"circle-stroke-width": 1.5,
+						}}
+					/>
+				</GeoJSONSource>
+
+				{/* Keep detections at their actual coordinates, without cluster centers. */}
 				<GeoJSONSource
 					id="fire-hotspots"
 					data={fires}
-					cluster={true}
-					clusterRadius={35}
+					cluster={false}
 					onPress={(event) => {
 						event.stopPropagation();
 
@@ -679,6 +1187,7 @@ export default function HomeScreen() {
 					<Layer
 						id="fire-hotspot-circles"
 						type="circle"
+						minzoom={HOTSPOT_DETAIL_ZOOM}
 						style={{
 							circleColor: "#ff3b30",
 							circleRadius: [
@@ -701,6 +1210,7 @@ export default function HomeScreen() {
 			</Map>
 
 			<View
+				onLayout={(event) => setHeaderHeight(event.nativeEvent.layout.height)}
 				style={{
 					position: "absolute",
 					top: 48,
@@ -718,16 +1228,21 @@ export default function HomeScreen() {
 				<Text style={{ color: "#cbd5e1", marginTop: 4 }}>
 					{loading
 						? "Loading satellite detections..."
-						: `${fires.features.length.toLocaleString()} hotspots • ${perimeters.features.length.toLocaleString()} perimeter features`
+						: `${hotspotCountLabel(fires.features.length)} • ${perimeters.features.length.toLocaleString()} wildfire boundaries`
 					}</Text>
 
-				<View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
-					{[24, 48, 168].map((value) => (
+				<Text style={{ color: "#cbd5e1", fontSize: 12, marginTop: 10 }}>
+					Hotspot time range
+				</Text>
+				<View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 6 }}>
+					{TIME_WINDOWS.map(({ hours: value, label }) => (
 						<Pressable
 							key={value}
 							onPress={() => {
-								console.log("Time button pressed:", value);
 								setHours(value);
+								setSelected(null);
+								setSelectedPerimeter(null);
+								setShowTechnical(false);
 							}}
 							style={{
 								paddingVertical: 8,
@@ -737,7 +1252,7 @@ export default function HomeScreen() {
 							}}
 						>
 							<Text style={{ color: "white", fontWeight: "600" }}>
-								{value === 168 ? "7 days" : `${value} hours`}
+								{label}
 							</Text>
 						</Pressable>
 					))}
@@ -754,6 +1269,32 @@ export default function HomeScreen() {
 					</Pressable>
 				</View>
 
+				<View style={{ flexDirection: "row", gap: 8, marginTop: 10 }}>
+					<Pressable
+						accessibilityRole="button"
+						accessibilityLabel="Find a fire by name and zoom to its boundary"
+						onPress={() => { setFireSearch(""); setShowFireList(true); }}
+						style={{ flex: 1, paddingVertical: 12, paddingHorizontal: 12,
+							borderRadius: 8, backgroundColor: "#075985", minHeight: 44 }}
+					>
+						<Text style={{ color: "white", fontWeight: "600" }}>Find a fire</Text>
+					</Pressable>
+					<Pressable
+						accessibilityRole="button"
+						accessibilityLabel="Followed fires and notification settings"
+						onPress={() => setShowFollowing(true)}
+						style={{ flex: 1, minHeight: 44, justifyContent: "center", paddingHorizontal: 12,
+							borderRadius: 8, backgroundColor: "#334155" }}
+					>
+						<Text style={{ color: "white", fontWeight: "600" }}>Following ({followed.following.length})</Text>
+					</Pressable>
+				</View>
+				<Text style={{ color: "#cbd5e1", fontSize: 12, marginTop: 8 }}>
+					Purple: boundary with hotspots · Blue: fire locator
+					{"\n"}Zoom in for red satellite hotspots.
+					{"\n"}{matchingPerimeterCount} {matchingPerimeterCount === 1 ? "boundary" : "boundaries"} with hotspots · past {timeRangeLabel}
+				</Text>
+
 				{loading && (
 					<ActivityIndicator
 						color="#f87171"
@@ -766,6 +1307,136 @@ export default function HomeScreen() {
 				)}
 			</View>
 
+			<Modal
+				visible={showFireList}
+				transparent
+				animationType="slide"
+				onRequestClose={() => setShowFireList(false)}
+			>
+				<View style={{ flex: 1, justifyContent: "flex-end", backgroundColor: "#00000088" }}>
+					<Pressable
+						style={{ flex: 1 }}
+						accessibilityRole="button"
+						accessibilityLabel="Close fire list"
+						onPress={() => setShowFireList(false)}
+					/>
+					<View style={{ height: "70%", backgroundColor: "#101820", padding: 20,
+						paddingBottom: 32, borderTopLeftRadius: 20, borderTopRightRadius: 20 }}>
+						<View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+							<Text style={{ color: "white", fontSize: 22, fontWeight: "bold", flex: 1 }}>Find a fire</Text>
+							<Pressable accessibilityRole="button" onPress={() => setShowFireList(false)}
+								style={{ padding: 12, minHeight: 44 }}>
+								<Text style={{ color: "#7dd3fc", fontWeight: "600" }}>Close</Text>
+							</Pressable>
+						</View>
+						<Text style={{ color: "#cbd5e1", marginBottom: 12 }}>
+							Hotspot matches appear first. Tap a row to zoom to its boundary.
+						</Text>
+						<TextInput
+							value={fireSearch}
+							onChangeText={setFireSearch}
+							placeholder="Search fire name"
+							placeholderTextColor="#94a3b8"
+							accessibilityLabel="Search fire name"
+							autoCorrect={false}
+							returnKeyType="search"
+							style={{ color: "white", backgroundColor: "#1e293b", borderRadius: 10,
+								paddingHorizontal: 14, paddingVertical: 12, fontSize: 16, marginBottom: 8 }}
+						/>
+						<FlatList
+							style={{ flex: 1 }}
+							data={fireList}
+							keyExtractor={(item) => perimeterKey(item)}
+							keyboardShouldPersistTaps="handled"
+							keyboardDismissMode="on-drag"
+							ListEmptyComponent={
+								<Text style={{ color: "#cbd5e1", paddingVertical: 24 }}>
+									{loading ? "Loading wildfire boundaries..." : error ? "Unable to load boundaries. Close this list and try Refresh." :
+										fireSearch.trim() ? "No fire names match your search." : "No wildfire boundaries available."}
+								</Text>
+							}
+							renderItem={({ item }) => (
+								<Pressable
+									accessibilityRole="button"
+									accessibilityLabel={`Zoom to ${perimeterName(item)}`}
+									onPress={() => focusPerimeter(item)}
+									style={{ paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: "#334155" }}
+								>
+									<Text style={{ color: "white", fontSize: 17, fontWeight: "600" }}>{perimeterName(item)}</Text>
+									<Text style={{ color: "#cbd5e1", marginTop: 5 }}>
+										Containment: {readableContainment(item.properties.attr_PercentContained)}
+									</Text>
+									<Text style={{ color: perimeterHotspotCount(item) > 0 ? "#e879f9" : "#94a3b8", marginTop: 5 }}>
+										{hotspotCountLabel(perimeterHotspotCount(item))} · past {timeRangeLabel}
+									</Text>
+									<Text style={{ color: "#7dd3fc", marginTop: 5 }}>View on map →</Text>
+								</Pressable>
+							)}
+						/>
+					</View>
+				</View>
+			</Modal>
+
+			<Modal visible={showFollowing} transparent animationType="slide" onRequestClose={() => setShowFollowing(false)}>
+				<View style={{ flex: 1, justifyContent: "flex-end", backgroundColor: "#00000088" }}>
+					<Pressable style={{ flex: 1 }} accessibilityRole="button" accessibilityLabel="Close followed fires"
+						onPress={() => setShowFollowing(false)} />
+					<View style={{ height: "78%", backgroundColor: "#101820", padding: 20, paddingBottom: 32,
+						borderTopLeftRadius: 20, borderTopRightRadius: 20 }}>
+						<View style={{ flexDirection: "row", alignItems: "center" }}>
+							<Text style={{ color: "white", fontSize: 21, fontWeight: "bold", flex: 1 }}>Following & notifications</Text>
+							<Pressable accessibilityRole="button" onPress={() => setShowFollowing(false)} style={{ padding: 12 }}>
+								<Text style={{ color: "#7dd3fc" }}>Close</Text>
+							</Pressable>
+						</View>
+						<Text style={{ color: "#cbd5e1", marginTop: 8 }}>
+							Receive incident-record, containment, boundary and newly received satellite-detection updates for fires you follow.
+						</Text>
+						<Text style={{ color: "#fcd34d", marginTop: 8 }}>
+							First version: checks run every 5 minutes while this map is open. No update checks run while the app is closed. These are informational updates, not evacuation alerts.
+						</Text>
+						<View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 12, marginBottom: 8 }}>
+							<Pressable disabled={!followed.ready || followed.busy} accessibilityRole="button" onPress={() => { void followed.enable(); }}
+								style={{ backgroundColor: "#075985", padding: 12, borderRadius: 8, opacity: followed.ready && !followed.busy ? 1 : 0.5 }}>
+								<Text style={{ color: "white" }}>Enable notifications</Text>
+							</Pressable>
+							<Pressable disabled={!followed.ready || followed.busy} accessibilityRole="button" onPress={() => { void followed.test(); }}
+								style={{ backgroundColor: "#334155", padding: 12, borderRadius: 8, opacity: followed.ready && !followed.busy ? 1 : 0.5 }}>
+								<Text style={{ color: "white" }}>Send test</Text>
+							</Pressable>
+							<Pressable accessibilityRole="button" onPress={() => { void Linking.openSettings().catch(() => {}); }} style={{ padding: 12 }}>
+								<Text style={{ color: "#7dd3fc" }}>Phone settings</Text>
+							</Pressable>
+						</View>
+						<Text style={{ color: "#cbd5e1", marginBottom: 8 }}>
+							{followed.allowed === true ? "Notification permission allowed" : followed.allowed === false ? "Notification permission blocked" : "Tap Enable notifications to check permission"}
+						</Text>
+						{!!followed.notice && <Text style={{ color: "#bae6fd", marginBottom: 10 }}>{followed.notice}</Text>}
+						<FlatList style={{ flex: 1 }} data={followed.following} keyExtractor={(fire) => fire.id}
+							ListEmptyComponent={<Text style={{ color: "#cbd5e1", paddingVertical: 20 }}>
+								{followed.ready ? "No followed fires yet. Open a fire's details and tap Follow fire." : "Loading followed fires..."}
+							</Text>}
+							renderItem={({ item }) => {
+								const mapped = perimeters.features.find((fire) => notificationFireId(fire) === item.id);
+								return <View style={{ paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: "#334155" }}>
+									<Text style={{ color: "white", fontSize: 17, fontWeight: "600" }}>{item.name}</Text>
+									<Text style={{ color: "#cbd5e1", marginTop: 5 }}>
+										{mapped ? "Available on the current map" : "Not in the latest active map results; current status is unknown."}
+									</Text>
+									<View style={{ flexDirection: "row", gap: 16, marginTop: 4 }}>
+										{mapped && <Pressable accessibilityRole="button" onPress={() => focusPerimeter(mapped)} style={{ paddingVertical: 12 }}>
+											<Text style={{ color: "#7dd3fc" }}>View on map</Text>
+										</Pressable>}
+										<Pressable disabled={followed.busy} accessibilityRole="button" onPress={() => { void followed.unfollow(item.id); }} style={{ paddingVertical: 12 }}>
+											<Text style={{ color: "#fca5a5" }}>Unfollow</Text>
+										</Pressable>
+									</View>
+								</View>;
+							}} />
+					</View>
+				</View>
+			</Modal>
+
 			{selectedPerimeter && (
 				<View
 					style={{
@@ -773,7 +1444,7 @@ export default function HomeScreen() {
 						bottom: 24,
 						left: 16,
 						right: 16,
-						maxHeight: "45%",
+						maxHeight: detailsMaxHeight,
 						backgroundColor: "#101820f5",
 						borderRadius: 14,
 						padding: 16,
@@ -796,9 +1467,26 @@ export default function HomeScreen() {
 						<Text style={{ color: "#ffd166", marginTop: 6 }}>
 							Reported wildfire boundary
 						</Text>
+						<Pressable
+							accessibilityRole="button"
+							disabled={!selectedFollowId || !followed.ready || followed.busy}
+							onPress={() => { void (selectedIsFollowed ? followed.unfollow(selectedFollowId) : followed.follow(selectedPerimeter)); }}
+							style={{ marginTop: 12, padding: 12, borderRadius: 8, backgroundColor: selectedIsFollowed ? "#334155" : "#075985",
+								opacity: selectedFollowId && followed.ready && !followed.busy ? 1 : 0.5 }}
+						>
+							<Text style={{ color: "white", textAlign: "center", fontWeight: "600" }}>
+								{!selectedFollowId ? "Following unavailable: incident ID missing" : !followed.ready ? "Loading follows..." :
+									selectedIsFollowed ? "Following — tap to unfollow" : "Follow fire"}
+							</Text>
+						</Pressable>
+						<Text style={{ color: "#94a3b8", marginTop: 6 }}>Update checks run while this map is open.</Text>
+						{!!followed.notice && <Text style={{ color: "#bae6fd", marginTop: 6 }}>{followed.notice}</Text>}
+						<Text style={{ color: "#e879f9", marginTop: 10 }}>
+							Satellite detections: {hotspotCountLabel(hotspotCounts.get(perimeterKey(selectedPerimeter)) ?? 0)} · past {timeRangeLabel}
+						</Text>
 
 						<Text style={{ color: "#e2e8f0", marginTop: 16 }}>
-							Classification: Reported wildfire
+							Status: Wildfire flagged as potentially active
 						</Text>
 
 						<Text style={{ color: "#e2e8f0", marginTop: 12 }}>
@@ -830,7 +1518,7 @@ export default function HomeScreen() {
 
 						<Text style={{ color: "#94a3b8", marginTop: 12 }}>
 							Containment is not the same as extinguishment.
-							A missing out date does not confirm current burning.
+							An active-candidate flag and missing out date do not confirm current burning.
 						</Text>
 
 						<Text style={{ color: "#e2e8f0", marginTop: 16 }}>
