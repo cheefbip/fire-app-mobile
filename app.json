@@ -8,7 +8,8 @@
     "scheme": "fireapp",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "com.anonymous.fireapp"
     },
     "android": {
       "adaptiveIcon": {
@@ -26,6 +27,15 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow Ignis to show your current location and center the map around you.",
+          "locationAlwaysAndWhenInUsePermission": false,
+          "locationAlwaysPermission": false,
+          "motionUsagePermission": false
+        }
+      ],
       [
         "expo-splash-screen",
         {
